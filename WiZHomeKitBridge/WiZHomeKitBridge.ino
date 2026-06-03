@@ -359,6 +359,16 @@ static void classify(const String &type, const char *&caps, const char *&hk) {
   else                       { caps = "on/off, brightness";                              hk = "Lightbulb (dimmable)"; }
 }
 
+// Deterministic AID from MAC: low 3 bytes (24-bit) + offset above the static
+// accessories (bridge=1, reed=2). Same device -> same AID on every boot, with no
+// persistence needed, so the Home app's accessory mapping never shifts.
+static uint32_t aidFromMac(const String &mac) {
+  String m = mac; m.replace(":", "");
+  if (m.length() < 6) return 0;
+  uint32_t low = strtoul(m.substring(m.length() - 6).c_str(), nullptr, 16);
+  return 100 + low;
+}
+
 // Create the HomeKit accessory for a device (deduped by MAC). Returns true if new.
 static bool createAccessory(IPAddress ip, const String &mac,
                             const String &moduleName, const String &type) {
@@ -367,7 +377,7 @@ static bool createAccessory(IPAddress ip, const String &mac,
 
   String name = friendlyName(type, mac);
 
-  new SpanAccessory();
+  new SpanAccessory(aidFromMac(mac));      // FIXED AID derived from MAC
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name(name.c_str());
@@ -590,8 +600,8 @@ void setup() {
   homeSpan.setWifiCallback(onWiFiConnected);
   homeSpan.begin(Category::Bridges, BRIDGE_NAME, "wiz-bridge");
 
-  // The bridge accessory itself (always the first accessory).
-  new SpanAccessory();
+  // The bridge accessory itself (always the first accessory) - fixed AID 1.
+  new SpanAccessory(1);
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name(BRIDGE_NAME);
@@ -599,8 +609,8 @@ void setup() {
       new Characteristic::Model("ESP32-WiZ-Bridge");
       new Characteristic::FirmwareRevision("1.0");
 
-  // Local hardware: magnetic reed switch -> HomeKit Contact Sensor.
-  new SpanAccessory();
+  // Local hardware: magnetic reed switch -> HomeKit Contact Sensor - fixed AID 2.
+  new SpanAccessory(2);
     new Service::AccessoryInformation();
       new Characteristic::Identify();
       new Characteristic::Name(REED_NAME);
