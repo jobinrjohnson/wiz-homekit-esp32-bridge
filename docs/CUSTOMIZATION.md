@@ -1,86 +1,94 @@
 # Customization & Extending
 
-How to tweak behavior and add support for more WiZ features.
+All knobs live in the **USER CONFIG** block at the top of
+`WiZHomeKitBridge.ino`.
 
-## Tunable settings
+## Settings
 
-All in the **USER CONFIG** block at the top of the `.ino`:
+| Macro | Default | Effect |
+|-------|---------|--------|
+| `SETUP_AP_SSID` | `"WiZBridge-Setup"` | name of the WiFi setup network |
+| `SETUP_AP_PASSWORD` | `"wizsetup"` | password for the setup network (`""` = open) |
+| `BRIDGE_NAME` | `"WiZ HomeKit Bridge"` | name shown in the Home app |
+| `PAIRING_CODE` | `"46637726"` | 8-digit HomeKit setup code (shown 466-37-726) |
+| `REED_PIN` | `23` | GPIO for the reed switch |
+| `REED_NAME` | `"Door Sensor"` | reed sensor name in Home |
+| `REED_ACTIVE_LOW` | `true` | `false` if your reed is normally-closed / inverted |
+| `MIN_BRIGHTNESS` | `10` | WiZ dimming floor (WiZ valid range is 10–100) |
+| `POLL_STEP_MS` | `2500` | gap between polling successive devices |
+| `REDISCOVER_MS` | `300000` | background re-scan interval (5 min) |
+| `DISCOVER_TIMEOUT` | `6.0` | seconds to listen during a boot scan |
+| `DISCOVER_PASSES` | `3` | subnet sweeps per boot scan |
 
-| Macro            | Default     | Effect                                              |
-|------------------|-------------|-----------------------------------------------------|
-| `BRIDGE_NAME`    | "WiZ HomeKit Bridge" | Name shown in the Home app.                |
-| `PAIRING_CODE`   | "46637726"  | 8-digit HomeKit setup code (shown as 466-37-726).   |
-| `MIN_BRIGHTNESS` | `10`        | Lowest `dimming` sent to WiZ (WiZ floor is 10).     |
-| `POLL_STEP_MS`   | `2500`      | Delay between polling successive devices.           |
-| `REDISCOVER_MS`  | `300000`    | How often to re-scan for new devices (ms).          |
-| `WIZ_TIMEOUT_MS` | `300`       | UDP response timeout per request.                   |
+> ⚠️ `PAIRING_CODE` must be a valid HomeKit code — **not** trivial/sequential
+> ones like `12345678`, `00000000`, `11111111` (HomeKit rejects those, and the
+> bridge then won't offer to pair).
 
-With many devices, increase `POLL_STEP_MS` to reduce UDP traffic, or decrease it
-for snappier external-change sync.
+## Common changes
 
-## Forcing devices instead of (or in addition to) discovery
+**Reed inverted (shows Open when closed):** flip `REED_ACTIVE_LOW`.
 
-If broadcast discovery is unreliable on your network, you can hard-code device
-IPs. Add this in `setup()` after `discoverAndAdd()`:
+**Move the reed to another pin:** change `REED_PIN` (see
+[HARDWARE.md](HARDWARE.md) for safe GPIOs).
 
-```cpp
-addDeviceAt(IPAddress(192,168,1,50));
-addDeviceAt(IPAddress(192,168,1,51));
-```
+**Quieter/looser discovery:** raise `POLL_STEP_MS` or `REDISCOVER_MS`; lower
+`DISCOVER_PASSES` to 2 for a faster boot at slightly lower reliability.
 
-`addDeviceAt()` still queries the device for its type and de-dupes by MAC, so
-it's safe to call even if discovery already found it.
+**Rename accessories:** edit `friendlyName()` — default names are
+`WiZ <Type> <last 6 of MAC>`. You can map specific MACs to room names, or just
+rename in the Home app after pairing.
 
-> Tip: give each WiZ device a **DHCP reservation** in your router so its IP
-> never changes.
+**Force fixed device IPs (skip discovery):** give devices DHCP reservations on
+your router. The firmware keys identity on MAC, so a stable IP just means control
+works immediately at boot before the first scan refreshes it.
 
-## Renaming accessories
+## How a HomeKit service is declared (to add sensors)
 
-Edit `friendlyName()`. By default names are `WiZ <Type> <last 6 of MAC>`. You
-could map specific MACs to room-friendly names:
-
-```cpp
-static String friendlyName(const String &type, const String &mac) {
-  if (mac == "a8bb50ABCDEF") return "Living Room Lamp";
-  if (mac == "a8bb50123456") return "Kitchen Plug";
-  ...
-}
-```
-
-(You can also just rename them in the Home app after pairing.)
-
-## Adding WiZ Scenes
-
-WiZ supports built-in dynamic scenes via `sceneId` (1–32). To expose, say, a
-"Party mode" you could add a stateless `Service::Switch` whose `update()` sends:
+The reed switch is the template. A service is a `struct` deriving a HomeSpan
+`Service::`, creating its `Characteristic::`s in the constructor and updating them
+in `loop()`:
 
 ```cpp
-wizSetPilot(ip, "\"sceneId\":6,\"speed\":100");   // 6 = Party
+struct MyMotion : Service::MotionSensor {
+  uint8_t pin;
+  SpanCharacteristic *detected;
+  MyMotion(uint8_t p) : Service::MotionSensor(), pin(p) {
+    pinMode(pin, INPUT);
+    detected = new Characteristic::MotionDetected(false);
+  }
+  void loop() override {
+    bool m = digitalRead(pin);
+    if (detected->getVal() != m) detected->setVal(m);
+  }
+};
 ```
+Then add it as its own accessory in `setup()` with a fixed AID (e.g. 3):
+```cpp
+new SpanAccessory(3);
+  new Service::AccessoryInformation();
+    new Characteristic::Identify();
+    new Characteristic::Name("Hallway Motion");
+  new MyMotion(27);
+```
+See [LIMITATIONS.md](LIMITATIONS.md) for the full list of service types.
 
-Common scene IDs: 1 Ocean, 2 Romance, 4 Sunset, 6 Party, 9 Cozy, 11 Forest,
-12 Pastel, 13 Wake-up, 14 Bedtime, 16 Warm white, 18 Daylight, 28 Candlelight.
+## Adding WiZ scenes (Switches)
 
-## Adding fan support (`FANDIM` modules)
+HomeKit has no light-effect selector, so WiZ scenes are exposed as **Switches**
+that send `setPilot {"sceneId":N}`. A momentary switch (fires the scene, then
+flips back off) works well and is automatable. Common scene IDs: 1 Ocean,
+4 Party, 5 Fireplace, 6 Cozy, 11 Warm White, 12 Daylight, 16 Relax,
+29 Candlelight. See [LIMITATIONS.md](LIMITATIONS.md#wiz-scenes).
 
-WiZ ceiling-fan modules report `FANDIM` in `moduleName` and accept extra params
-(`fanState`, `fanSpeed`, `fanRevrs`). To support them, add a branch in
-`addDeviceAt()` that creates a `Service::Fan` alongside the `LightBulb` and maps
-`Characteristic::RotationSpeed` / `Active` to `setPilot` `fanSpeed`/`fanState`.
+## Energy monitoring (plugs)
 
-## Changing the color-temperature range
+WiZ energy plugs answer `getPower` (milliwatts), but the **stock Home app has no
+power/energy UI**. It can be surfaced to the **Eve app** and other third-party
+HomeKit apps via Eve custom characteristics. See
+[LIMITATIONS.md](LIMITATIONS.md#energy-monitoring).
+
+## Color-temperature range
 
 HomeKit `ColorTemperature` is in **mired**. The sketch uses `153–454`
-(≈ 6500K–2200K). To restrict the slider to, say, 2700K–5000K:
-
-```cpp
-cct = (new Characteristic::ColorTemperature(250))->setRange(200, 370);
-```
-(`mired = 1_000_000 / kelvin`.)
-
-## Removing devices from HomeKit
-
-This firmware adds devices but does not auto-remove unreachable ones (to avoid
-flapping when a device is briefly offline). To clear stale accessories, reset
-the HomeKit pairing (`H` over serial) and re-pair, or reboot after the device is
-permanently gone.
+(≈ 6500K–2200K). To restrict the slider, change the `setRange()` on the
+`ColorTemperature` characteristic (`mired = 1_000_000 / kelvin`).
