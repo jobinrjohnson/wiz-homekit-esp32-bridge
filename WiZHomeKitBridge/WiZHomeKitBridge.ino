@@ -342,7 +342,7 @@ static bool createAccessory(IPAddress ip, const String &mac,
 // discover() - port of discover_wiz.py: one ephemeral broadcast-capable socket;
 // send registration+getPilot to the broadcast addresses AND a unicast getPilot to
 // every host; then collect the IPs that reply for `timeoutSec`.
-static std::vector<IPAddress> wizDiscover(float timeoutSec) {
+static std::vector<IPAddress> wizDiscover(float timeoutSec, int passes) {
   std::vector<IPAddress> found;
 
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -410,7 +410,7 @@ static std::vector<IPAddress> wizDiscover(float timeoutSec) {
 
   // Multiple passes: a device whose probe is dropped (ARP miss / TX overflow) on
   // one pass gets another chance on the next.
-  const int PASSES = DISCOVER_PASSES;
+  const int PASSES = passes;
   uint32_t perPassMs = (uint32_t)(timeoutSec * 1000) / PASSES;
 
   for (int pass = 0; pass < PASSES; pass++) {
@@ -491,10 +491,11 @@ static void reportAndAdd(IPAddress ip) {
 }
 
 // main() discovery flow - port of discover_wiz.py main(). Returns # new devices.
-static int discoverAndAdd() {
+static int discoverAndAdd(float timeoutSec = DISCOVER_TIMEOUT,
+                          int passes = DISCOVER_PASSES) {
   size_t before = knownMacs.size();
 
-  std::vector<IPAddress> found = wizDiscover(DISCOVER_TIMEOUT);
+  std::vector<IPAddress> found = wizDiscover(timeoutSec, passes);
 
   Serial.println();
   Serial.printf("Discovered %d WiZ device(s).\n", (int)found.size());
@@ -572,4 +573,21 @@ void loop() {
     idx++;
   }
 
+  // Background re-discovery: catches any device missed at boot or added to the
+  // network later. Uses a LIGHTER scan (shorter, single pass) than boot so it
+  // doesn't stall HAP for long; misses are still caught because it repeats.
+  // Cadence: quick for the first ~2 min (catch boot misses fast), then every
+  // REDISCOVER_MS. New devices are published live via updateDatabase().
+  static uint32_t lastScan = 0;
+  static int      quickScans = 4;            // first 4 rescans are 30s apart
+  uint32_t interval = (quickScans > 0) ? 30000UL : REDISCOVER_MS;
+  if (wifiUp && millis() - lastScan > interval) {
+    lastScan = millis();
+    if (quickScans > 0) quickScans--;
+    int added = discoverAndAdd(2.0f, 1);     // ~2s, single pass
+    if (added > 0) {
+      Serial.printf("[WiZ] re-discovery added %d new device(s); updating HomeKit.\n", added);
+      homeSpan.updateDatabase();
+    }
+  }
 }
