@@ -19,8 +19,11 @@
  *   - "esp32" by Espressif Systems (Boards Manager). Select any ESP32 dev board.
  *
  * SETUP:
- *   1. Fill in WIFI_SSID and WIFI_PASS below.
- *   2. Flash to the ESP32 (115200 baud serial monitor to watch discovery).
+ *   1. Flash to the ESP32 (115200 baud serial monitor to watch progress).
+ *   2. WiFi is provisioned from your phone (no hardcoded credentials):
+ *      on the iPhone, join the "WiZBridge-Setup" WiFi network (password
+ *      "wizsetup"); a captive-portal page opens - enter your home WiFi there.
+ *      (To re-provision later, type 'X' in the serial monitor to erase WiFi.)
  *   3. In the Apple Home app: Add Accessory -> "More options..." -> select
  *      "WiZ HomeKit Bridge". Pairing code (default HomeSpan code): 466-37-726.
  *      All discovered WiZ devices appear as one bridge.
@@ -44,8 +47,12 @@
 #include <fcntl.h>          // non-blocking socket for draining replies mid-sweep
 
 // ====================== USER CONFIG ==========================================
-#define WIFI_SSID   "A404 Wifi"
-#define WIFI_PASS   "Test@123"
+// WiFi is provisioned from your phone - there are NO hardcoded credentials.
+// On first boot (or after erasing WiFi via the 'X' serial command), the ESP32
+// starts the setup Access Point below. Join it from the iPhone and a captive-
+// portal page lets you enter your home WiFi network + password.
+#define SETUP_AP_SSID     "WiZBridge-Setup"  // setup network the phone joins
+#define SETUP_AP_PASSWORD "wizsetup"         // password for that setup network
 
 #define BRIDGE_NAME "WiZ HomeKit Bridge"
 #define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726
@@ -592,9 +599,12 @@ void setup() {
   delay(200);
   Serial.println("\n[WiZHomeKitBridge] starting...");
 
-  // Let HomeSpan own WiFi. Provide credentials so it connects automatically and
-  // skips its provisioning AP. Discovery is triggered from onWiFiConnected().
-  homeSpan.setWifiCredentials(WIFI_SSID, WIFI_PASS);
+  // HomeSpan owns WiFi. No hardcoded credentials: if none are stored, it auto-
+  // starts the setup Access Point so WiFi can be provisioned from the phone.
+  // Discovery is triggered from onWiFiConnected() once a connection is up.
+  homeSpan.setApSSID(SETUP_AP_SSID);
+  homeSpan.setApPassword(SETUP_AP_PASSWORD);
+  homeSpan.enableAutoStartAP();            // start setup AP when no WiFi saved
   homeSpan.setPairingCode(PAIRING_CODE);
   homeSpan.setLogLevel(0);   // silence HomeSpan HAP chatter so our logs are readable
   homeSpan.setWifiCallback(onWiFiConnected);
