@@ -53,9 +53,12 @@ Full guides live in [`docs/`](docs/):
 
 ## How it works
 
-- **Discovery** — UDP broadcast of a WiZ `registration` probe on port `38899`;
-  responding devices are queried with `getSystemConfig` to read their
-  `moduleName` and MAC, which determines the HomeKit type.
+- **Discovery** — two methods are used automatically: (1) a UDP `registration`
+  **broadcast** on port `38899`, and (2) an **active unicast sweep** that pings
+  every host on the local subnet. The sweep needs no broadcast, so devices are
+  found even on routers/mesh systems that filter broadcast (the usual cause of
+  "no devices found"). Each responder is queried with `getSystemConfig` to read
+  its `moduleName` and MAC, which determines the HomeKit type.
 - **Control** — Home-app changes trigger `update()`, which sends a WiZ
   `setPilot` command (state / dimming / temp / r,g,b).
 - **Sync** — a round-robin poller calls `getPilot` on one device every

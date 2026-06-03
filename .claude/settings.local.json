@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile discover_wiz.py)",
+      "Bash(python3 discover_wiz.py --help)"
+    ]
+  }
+}

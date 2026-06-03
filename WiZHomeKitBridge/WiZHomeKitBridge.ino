@@ -42,8 +42,8 @@
 #include <math.h>
 
 // ====================== USER CONFIG ==========================================
-#define WIFI_SSID   "YOUR_WIFI_SSID"
-#define WIFI_PASS   "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID   "A404 Wifi"
+#define WIFI_PASS   "Test@123"
 
 #define BRIDGE_NAME "WiZ HomeKit Bridge"
 #define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726
@@ -282,23 +282,40 @@ static String friendlyName(const String &type, const String &mac) {
 // Query a single IP, figure out its type, and build the HomeKit accessory.
 // Returns true if a NEW accessory was added.
 static bool addDeviceAt(IPAddress ip) {
+  Serial.printf("[add] %s -> getSystemConfig ...\n", ip.toString().c_str());
   JsonDocument doc;
-  if (!wizRequest(ip, "{\"method\":\"getSystemConfig\",\"params\":{}}", doc, 500))
+  if (!wizRequest(ip, "{\"method\":\"getSystemConfig\",\"params\":{}}", doc, 800)) {
+    Serial.printf("[add] %s -> NO reply to getSystemConfig\n",
+                  ip.toString().c_str());
     return false;
+  }
   JsonVariant res = doc["result"];
-  if (res.isNull()) return false;
+  if (res.isNull()) {
+    Serial.printf("[add] %s -> reply had no 'result' field\n",
+                  ip.toString().c_str());
+    return false;
+  }
 
   String mac        = res["mac"]        | "";
   String moduleName = res["moduleName"] | "";
-  if (mac.length() == 0) return false;
+  Serial.printf("[add] %s -> mac=%s module=%s\n",
+                ip.toString().c_str(), mac.c_str(), moduleName.c_str());
+  if (mac.length() == 0) {
+    Serial.printf("[add] %s -> no MAC, skipping\n", ip.toString().c_str());
+    return false;
+  }
 
   for (auto &m : knownMacs)            // already added?
-    if (m == mac) return false;
+    if (m == mac) {
+      Serial.printf("[add] %s -> mac %s already added, skipping\n",
+                    ip.toString().c_str(), mac.c_str());
+      return false;
+    }
 
   String type = detectType(moduleName);
   String name = friendlyName(type, mac);
 
-  Serial.printf("  + %s  ip=%s  mac=%s  module=%s  type=%s\n",
+  Serial.printf("  + ADDED %s  ip=%s  mac=%s  module=%s  type=%s\n",
                 name.c_str(), ip.toString().c_str(), mac.c_str(),
                 moduleName.c_str(), type.c_str());
 
@@ -323,81 +340,149 @@ static bool addDeviceAt(IPAddress ip) {
   return true;
 }
 
-// Broadcast a discovery probe and collect responding device IPs, then add any
-// that are new. Returns the number of newly added accessories.
-static int discoverAndAdd() {
-  const char *probe =
-      "{\"method\":\"registration\",\"params\":{"
-      "\"phoneMac\":\"AAAAAAAAAAAA\",\"register\":false,"
-      "\"phoneIp\":\"1.2.3.4\",\"id\":\"1\"}}";
+// Record a responder IP in `found` if not already present. Returns true if new.
+static bool noteFound(std::vector<IPAddress> &found, IPAddress ip) {
+  for (auto &f : found) if (f == ip) return false;
+  found.push_back(ip);
+  return true;
+}
 
-  // Subnet-directed broadcast (more reliable than 255.255.255.255 on some APs).
-  IPAddress bc   = WiFi.localIP();
+// Drain every UDP packet currently waiting and log it. Any responder is a live
+// WiZ device (only they listen on 38899). Returns how many packets it read.
+static int drainAndLog(std::vector<IPAddress> &found) {
+  int count = 0;
+  int sz;
+  while ((sz = wizUDP.parsePacket()) > 0) {
+    IPAddress remote = wizUDP.remoteIP();
+    uint16_t  rport  = wizUDP.remotePort();
+    char buf[700];
+    int n = wizUDP.read(buf, sizeof(buf) - 1);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    bool isNew = noteFound(found, remote);
+    Serial.printf("[scan] REPLY from %s:%u (%d bytes)%s -> %s\n",
+                  remote.toString().c_str(), rport, n,
+                  isNew ? " [NEW DEVICE]" : "", buf);
+    count++;
+  }
+  return count;
+}
+
+// Listen for replies for `windowMs`, logging each one.
+static void listenAndLog(std::vector<IPAddress> &found, uint32_t windowMs) {
+  uint32_t start = millis();
+  while (millis() - start < windowMs) {
+    if (drainAndLog(found) == 0) delay(2);
+  }
+}
+
+// Discovery: enumerate every IP on the local subnet, send a getPilot to each
+// (this probes whether a device exists AND that UDP:38899 is open), and collect
+// the IPs that reply. No broadcast, so it works through broadcast-filtering APs.
+// PASSES > 1 because the first unicast to an un-ARP'd host is often dropped while
+// ARP resolves; a second pass reaches devices the first one missed.
+static void collectViaScan(std::vector<IPAddress> &found) {
+  const char *probe = "{\"method\":\"getPilot\",\"params\":{}}";
+  const int   PASSES = 2;
+
+  IPAddress ip   = WiFi.localIP();
   IPAddress mask = WiFi.subnetMask();
-  for (int i = 0; i < 4; i++) bc[i] = (bc[i] & mask[i]) | (~mask[i] & 0xFF);
+  IPAddress net;
+  for (int i = 0; i < 4; i++) net[i] = ip[i] & mask[i];
 
-  std::vector<IPAddress> found;
+  uint32_t hostBits = 0;
+  for (int i = 0; i < 4; i++)
+    hostBits += __builtin_popcount((uint8_t)(~mask[i] & 0xFF));
+  uint32_t hostCount = (hostBits >= 20) ? 0 : ((1UL << hostBits) - 1);
+  if (hostCount < 1 || hostCount > 1022) hostCount = 254;   // default to a /24
 
-  for (int attempt = 0; attempt < 3; attempt++) {
-    while (wizUDP.parsePacket() > 0) wizUDP.flush();
-    wizUDP.beginPacket(bc, WIZ_PORT);
-    wizUDP.write((const uint8_t *)probe, strlen(probe));
-    wizUDP.endPacket();
-    wizUDP.beginPacket(IPAddress(255, 255, 255, 255), WIZ_PORT);
-    wizUDP.write((const uint8_t *)probe, strlen(probe));
-    wizUDP.endPacket();
+  uint32_t netAddr = ((uint32_t)net[0] << 24) | ((uint32_t)net[1] << 16) |
+                     ((uint32_t)net[2] << 8) | net[3];
 
-    uint32_t start = millis();
-    while (millis() - start < 1200) {
-      int sz = wizUDP.parsePacket();
-      if (sz > 0) {
-        IPAddress remote = wizUDP.remoteIP();
-        char tmp[512];
-        wizUDP.read(tmp, sizeof(tmp) - 1);   // contents not needed here
-        bool seen = false;
-        for (auto &f : found) if (f == remote) { seen = true; break; }
-        if (!seen) found.push_back(remote);
+  Serial.printf("[scan] my IP=%s mask=%s -> network %s, probing %u hosts, %d passes\n",
+                ip.toString().c_str(), mask.toString().c_str(),
+                net.toString().c_str(), hostCount, PASSES);
+
+  for (int pass = 1; pass <= PASSES; pass++) {
+    int sentOk = 0, sentFail = 0;
+    for (uint32_t h = 1; h <= hostCount; h++) {
+      uint32_t a = netAddr + h;
+      IPAddress target((a >> 24) & 0xFF, (a >> 16) & 0xFF,
+                       (a >> 8) & 0xFF, a & 0xFF);
+      if (target == ip) continue;                  // skip ourselves
+
+      int ok = 0;
+      if (wizUDP.beginPacket(target, WIZ_PORT)) {
+        wizUDP.write((const uint8_t *)probe, strlen(probe));
+        ok = wizUDP.endPacket();                   // 1 = queued, 0 = send failed
       }
-      delay(2);
+      if (ok) sentOk++; else sentFail++;
+
+      delay(3);                                    // pace + let ARP/replies flow
+      if (h % 16 == 0) drainAndLog(found);         // collect replies as we go
     }
+    Serial.printf("[scan] pass %d/%d: probes sent ok=%d failed=%d, responders so far=%d\n",
+                  pass, PASSES, sentOk, sentFail, (int)found.size());
+    listenAndLog(found, 1500);                     // listen after each pass
   }
 
-  Serial.printf("Discovery: %d device(s) responded.\n", (int)found.size());
+  Serial.printf("[scan] finished: %d WiZ responder(s)\n", (int)found.size());
+}
+
+// Sweep the subnet, then create accessories for any new devices that replied.
+// Returns the number of newly added accessories.
+static int discoverAndAdd() {
+  std::vector<IPAddress> found;
+  while (wizUDP.parsePacket() > 0) wizUDP.flush();   // clear stale RX
+
+  collectViaScan(found);
+
+  if (found.empty()) {
+    Serial.println("[scan] zero replies from the whole subnet. Either no WiZ "
+                   "device is reachable, or 38899 traffic is blocked.");
+  }
 
   int added = 0;
   for (auto &ip : found)
     if (addDeviceAt(ip)) added++;
+  Serial.printf("[scan] added %d new accessory(ies) this round.\n", added);
   return added;
 }
 
 // =============================================================================
+bool wifiUp = false;   // set true once HomeSpan reports WiFi connected
+
+// Called by HomeSpan ONCE the WiFi connection is fully established. This is the
+// only safe place to do UDP work - doing it in setup() runs before HomeSpan has
+// actually brought the network up, so the scan would hit a dead network.
+void onWiFiConnected() {
+  wifiUp = true;
+  wizUDP.begin(WIZ_PORT);   // bind UDP now that the network is alive
+
+  Serial.printf("WiFi up. IP=%s  subnet=%s\n",
+                WiFi.localIP().toString().c_str(),
+                WiFi.subnetMask().toString().c_str());
+
+  Serial.println("Scanning subnet for WiZ devices (getPilot to every IP)...");
+  int n = discoverAndAdd();
+  Serial.printf("Total WiZ accessories: %d\n", (int)knownMacs.size());
+
+  if (n > 0)
+    homeSpan.updateDatabase();   // publish the freshly-found accessories
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[WiZHomeKitBridge] starting...");
 
-  // Bring up WiFi manually first so we can run UDP discovery before HomeSpan
-  // builds the accessory database.
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("WiFi connected. IP = ");
-  Serial.println(WiFi.localIP());
-
-  wizUDP.begin(WIZ_PORT);
-
-  // Configure HomeSpan. Provide the same WiFi credentials so HomeSpan won't
-  // launch its own provisioning AP (we keep the connection we already made).
+  // Let HomeSpan own WiFi. Provide credentials so it connects automatically and
+  // skips its provisioning AP. Discovery is triggered from onWiFiConnected().
   homeSpan.setWifiCredentials(WIFI_SSID, WIFI_PASS);
   homeSpan.setPairingCode(PAIRING_CODE);
   homeSpan.setLogLevel(1);
-  homeSpan.begin(Category::Bridge, BRIDGE_NAME, "wiz-bridge");
+  homeSpan.setWifiCallback(onWiFiConnected);
+  homeSpan.begin(Category::Bridges, BRIDGE_NAME, "wiz-bridge");
 
   // The bridge accessory itself (always the first accessory).
   new SpanAccessory();
@@ -407,17 +492,18 @@ void setup() {
       new Characteristic::Manufacturer("WiZ");
       new Characteristic::Model("ESP32-WiZ-Bridge");
       new Characteristic::FirmwareRevision("1.0");
-
-  Serial.println("Scanning network for WiZ devices...");
-  int n = discoverAndAdd();
-  Serial.printf("Added %d WiZ accessory(ies).\n", n);
-  if (n == 0)
-    Serial.println("No WiZ devices found yet - will keep re-scanning. "
-                   "Check that they're on the same subnet.");
 }
 
 void loop() {
   homeSpan.poll();
+
+  // Heartbeat: print the current bridged-device count every 15s so the result
+  // of discovery is always visible at the tail of the serial log.
+  static uint32_t lastBeat = 0;
+  if (millis() - lastBeat > 15000) {
+    lastBeat = millis();
+    Serial.printf("[WiZ] bridged devices: %d\n", (int)knownMacs.size());
+  }
 
   // Round-robin state polling: one device per POLL_STEP_MS to avoid blocking.
   static uint32_t lastPoll = 0;
@@ -431,7 +517,7 @@ void loop() {
 
   // Periodic re-discovery to pick up newly added WiZ devices at runtime.
   static uint32_t lastScan = 0;
-  if (millis() - lastScan > REDISCOVER_MS) {
+  if (wifiUp && millis() - lastScan > REDISCOVER_MS) {
     lastScan = millis();
     int added = discoverAndAdd();
     if (added > 0) {
