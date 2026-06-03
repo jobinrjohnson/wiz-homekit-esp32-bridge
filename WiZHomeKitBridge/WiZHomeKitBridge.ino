@@ -36,10 +36,12 @@
 
 #include "HomeSpan.h"
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <algorithm>
 #include <math.h>
+#include <lwip/sockets.h>   // BSD sockets - direct port of discover_wiz.py
+#include <fcntl.h>          // non-blocking socket for draining replies mid-sweep
 
 // ====================== USER CONFIG ==========================================
 #define WIFI_SSID   "A404 Wifi"
@@ -48,14 +50,13 @@
 #define BRIDGE_NAME "WiZ HomeKit Bridge"
 #define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726
 
-#define WIZ_PORT          38899          // WiZ UDP control port
+#define WIZ_PORT          38899          // WiZ UDP control port (devices listen here)
 #define MIN_BRIGHTNESS    10             // WiZ dimming floor (valid range 10-100)
 #define POLL_STEP_MS      2500           // poll one device every this many ms (round-robin)
 #define REDISCOVER_MS     300000UL       // re-scan network for new devices (5 min)
-#define WIZ_TIMEOUT_MS    300            // per-request UDP response timeout
+#define DISCOVER_TIMEOUT  6.0f           // total seconds to listen for discovery replies
+#define DISCOVER_PASSES   3              // sweep the subnet this many times
 // =============================================================================
-
-WiFiUDP wizUDP;
 
 // ---- HSV <-> RGB helpers ----------------------------------------------------
 static void hsv2rgb(double H, double S, double V, int &R, int &G, int &B) {
@@ -88,40 +89,55 @@ static void rgb2hsv(int R, int G, int B, double &H, double &S, double &V) {
   if (H < 0) H += 360;
 }
 
-// ---- Low-level WiZ UDP request/response -------------------------------------
-// Sends a JSON command to a specific device IP and parses the JSON reply.
-static bool wizRequest(IPAddress ip, const char *json, JsonDocument &doc,
-                       uint32_t timeout = WIZ_TIMEOUT_MS) {
-  while (wizUDP.parsePacket() > 0) wizUDP.flush();   // drain stale packets
-  wizUDP.beginPacket(ip, WIZ_PORT);
-  wizUDP.write((const uint8_t *)json, strlen(json));
-  wizUDP.endPacket();
+// ---- Low-level WiZ UDP (BSD sockets - port of discover_wiz.py) ---------------
 
-  uint32_t start = millis();
-  while (millis() - start < timeout) {
-    int sz = wizUDP.parsePacket();
-    if (sz > 0) {
-      if (wizUDP.remoteIP() == ip) {
-        char buf[1024];
-        int n = wizUDP.read(buf, sizeof(buf) - 1);
-        buf[n] = 0;
-        doc.clear();
-        if (!deserializeJson(doc, buf)) return true;
-      } else {
-        wizUDP.flush();
-      }
-    }
-    delay(2);
-  }
-  return false;
+// Build a sockaddr_in for ip:WIZ_PORT. `s_addr` is the network-order address;
+// (uint32_t)IPAddress already gives exactly that on this platform.
+static struct sockaddr_in wizAddr(uint32_t s_addr) {
+  struct sockaddr_in d;
+  memset(&d, 0, sizeof(d));
+  d.sin_family = AF_INET;
+  d.sin_port = htons(WIZ_PORT);
+  d.sin_addr.s_addr = s_addr;
+  return d;
 }
 
-// Fire-and-forget raw JSON to a device (or broadcast) on the WiZ port.
-// Returns true if the packet was queued for sending.
+// Fire-and-forget raw JSON to a device on the WiZ port (fresh socket each time).
 static bool wizSendRaw(IPAddress ip, const char *json) {
-  if (!wizUDP.beginPacket(ip, WIZ_PORT)) return false;
-  wizUDP.write((const uint8_t *)json, strlen(json));
-  return wizUDP.endPacket() == 1;
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) return false;
+  struct sockaddr_in d = wizAddr((uint32_t)ip);
+  int r = sendto(sock, json, strlen(json), 0, (struct sockaddr *)&d, sizeof(d));
+  close(sock);
+  return r > 0;
+}
+
+// query() - exactly like discover_wiz.py: open a fresh ephemeral socket, send
+// one method, wait for the reply, parse it. A new socket per call means we only
+// ever hear OUR reply (no port-38899 broadcast noise to confuse matching).
+static bool wizQuery(IPAddress ip, const char *method, JsonDocument &doc,
+                     float timeoutSec = 1.5f) {
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) return false;
+
+  struct timeval tv;
+  tv.tv_sec  = (int)timeoutSec;
+  tv.tv_usec = (int)((timeoutSec - (int)timeoutSec) * 1000000);
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  char payload[96];
+  int len = snprintf(payload, sizeof(payload),
+                     "{\"method\":\"%s\",\"params\":{}}", method);
+  struct sockaddr_in d = wizAddr((uint32_t)ip);
+  sendto(sock, payload, len, 0, (struct sockaddr *)&d, sizeof(d));
+
+  char buf[2048];
+  int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
+  close(sock);
+  if (n <= 0) return false;
+  buf[n] = 0;
+  doc.clear();
+  return deserializeJson(doc, buf) == DeserializationError::Ok;
 }
 
 // Fire-and-forget setPilot (control) command.
@@ -202,7 +218,7 @@ struct WiZLight : Service::LightBulb, WiZPollable {
   // Round-robin pull of the real bulb state back into HomeKit.
   void pollState() override {
     JsonDocument doc;
-    if (!wizRequest(ip, "{\"method\":\"getPilot\",\"params\":{}}", doc)) return;
+    if (!wizQuery(ip, "getPilot", doc)) return;
     JsonVariant res = doc["result"];
     if (res.isNull()) return;
 
@@ -250,7 +266,7 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
 
   void pollState() override {
     JsonDocument doc;
-    if (!wizRequest(ip, "{\"method\":\"getPilot\",\"params\":{}}", doc)) return;
+    if (!wizQuery(ip, "getPilot", doc)) return;
     JsonVariant res = doc["result"];
     if (res.isNull() || res["state"].isNull()) return;
     bool st = res["state"];
@@ -267,6 +283,8 @@ static String detectType(const String &moduleName) {
   String s = moduleName;
   s.toUpperCase();
   if (s.indexOf("SOCKET") >= 0) return "SOCKET";
+  if (s.indexOf("PLUG")   >= 0) return "SOCKET";
+  if (s.indexOf("SWITCH") >= 0) return "SOCKET";
   if (s.indexOf("RGB")    >= 0) return "RGB";
   if (s.indexOf("TW")     >= 0) return "TW";
   if (s.indexOf("DW")     >= 0) return "DW";
@@ -285,53 +303,21 @@ static String friendlyName(const String &type, const String &mac) {
   return base + suffix;
 }
 
-// Query a single IP, figure out its type, and build the HomeKit accessory.
-// Returns true if a NEW accessory was added.
-static bool addDeviceAt(IPAddress ip) {
-  Serial.printf("[add] %s -> getSystemConfig ...\n", ip.toString().c_str());
-  JsonDocument doc;
-  if (!wizRequest(ip, "{\"method\":\"getSystemConfig\",\"params\":{}}", doc, 800)) {
-    Serial.printf("[add] %s -> NO reply to getSystemConfig\n",
-                  ip.toString().c_str());
-    return false;
-  }
-  JsonVariant res = doc["result"];
-  if (res.isNull()) {
-    Serial.printf("[add] %s -> reply had no 'result' field\n",
-                  ip.toString().c_str());
-    return false;
-  }
-
-  String mac        = res["mac"]        | "";
-  String moduleName = res["moduleName"] | "";
-  Serial.printf("[add] %s -> mac=%s module=%s\n",
-                ip.toString().c_str(), mac.c_str(), moduleName.c_str());
-  if (mac.length() == 0) {
-    Serial.printf("[add] %s -> no MAC, skipping\n", ip.toString().c_str());
-    return false;
-  }
-
-  for (auto &m : knownMacs)            // already added?
-    if (m == mac) {
-      Serial.printf("[add] %s -> mac %s already added, skipping\n",
-                    ip.toString().c_str(), mac.c_str());
-      return false;
-    }
-
-  String type = detectType(moduleName);
-  String name = friendlyName(type, mac);
-
-  const char *caps, *hk;
+// classify() - port of discover_wiz.py: type + capability string + HomeKit type.
+static void classify(const String &type, const char *&caps, const char *&hk) {
   if      (type == "SOCKET") { caps = "on/off";                                          hk = "Outlet"; }
   else if (type == "RGB")    { caps = "on/off, brightness, color (RGB), tunable white";  hk = "Lightbulb (color)"; }
   else if (type == "TW")     { caps = "on/off, brightness, tunable white (CCT)";         hk = "Lightbulb (white)"; }
   else                       { caps = "on/off, brightness";                              hk = "Lightbulb (dimmable)"; }
+}
 
-  Serial.printf("  + ADDED %s  ip=%s\n", name.c_str(), ip.toString().c_str());
-  Serial.printf("      mac=%s  module=%s  type=%s\n",
-                mac.c_str(), moduleName.c_str(), type.c_str());
-  Serial.printf("      capabilities=%s\n", caps);
-  Serial.printf("      HomeKit as=%s\n", hk);
+// Create the HomeKit accessory for a device (deduped by MAC). Returns true if new.
+static bool createAccessory(IPAddress ip, const String &mac,
+                            const String &moduleName, const String &type) {
+  for (auto &m : knownMacs)
+    if (m == mac) return false;            // already added
+
+  String name = friendlyName(type, mac);
 
   new SpanAccessory();
     new Service::AccessoryInformation();
@@ -339,7 +325,7 @@ static bool addDeviceAt(IPAddress ip) {
       new Characteristic::Name(name.c_str());
       new Characteristic::Manufacturer("WiZ");
       new Characteristic::SerialNumber(mac.c_str());
-      new Characteristic::Model(moduleName.length() ? moduleName.c_str() : "WiZ");
+      new Characteristic::Model(moduleName.c_str());
       new Characteristic::FirmwareRevision("1.0");
 
   if (type == "SOCKET") {
@@ -349,126 +335,177 @@ static bool addDeviceAt(IPAddress ip) {
     bool cct   = (type == "RGB" || type == "TW");
     pollables.push_back(new WiZLight(ip, color, cct));
   }
-
   knownMacs.push_back(mac);
   return true;
 }
 
-// Record a responder IP in `found` if not already present. Returns true if new.
-static bool noteFound(std::vector<IPAddress> &found, IPAddress ip) {
-  for (auto &f : found) if (f == ip) return false;
-  found.push_back(ip);
-  return true;
-}
+// discover() - port of discover_wiz.py: one ephemeral broadcast-capable socket;
+// send registration+getPilot to the broadcast addresses AND a unicast getPilot to
+// every host; then collect the IPs that reply for `timeoutSec`.
+static std::vector<IPAddress> wizDiscover(float timeoutSec) {
+  std::vector<IPAddress> found;
 
-// Drain every UDP packet currently waiting and log it. Any responder is a live
-// WiZ device (only they listen on 38899). Returns how many packets it read.
-static int drainAndLog(std::vector<IPAddress> &found) {
-  int count = 0;
-  int sz;
-  while ((sz = wizUDP.parsePacket()) > 0) {
-    IPAddress remote = wizUDP.remoteIP();
-    uint16_t  rport  = wizUDP.remotePort();
-    char buf[700];
-    int n = wizUDP.read(buf, sizeof(buf) - 1);
-    if (n < 0) n = 0;
-    buf[n] = 0;
-    bool isNew = noteFound(found, remote);
-    Serial.printf("[scan] REPLY from %s:%u (%d bytes)%s -> %s\n",
-                  remote.toString().c_str(), rport, n,
-                  isNew ? " [NEW DEVICE]" : "", buf);
-    count++;
-  }
-  return count;
-}
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0) { Serial.println("socket() failed"); return found; }
+  int yes = 1;
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));   // like Python
 
-// Listen for replies for `windowMs`, logging each one.
-static void listenAndLog(std::vector<IPAddress> &found, uint32_t windowMs) {
-  uint32_t start = millis();
-  while (millis() - start < windowMs) {
-    if (drainAndLog(found) == 0) delay(2);
-  }
-}
+  struct sockaddr_in local;
+  memset(&local, 0, sizeof(local));
+  local.sin_family = AF_INET;
+  local.sin_addr.s_addr = INADDR_ANY;
+  local.sin_port = 0;                       // ephemeral local port (bind(("",0)))
+  bind(sock, (struct sockaddr *)&local, sizeof(local));
 
-// Discovery - same logic as discover_wiz.py:
-//   1. send getPilot (+ a registration probe) to the broadcast address
-//   2. send a unicast getPilot to every host on the subnet
-//   3. collect every IP that replies (only real WiZ devices answer on 38899)
-// On the ESP32 we also drain replies *during* the sweep, because its small UDP
-// receive buffer would otherwise overflow while we blast out probes.
-static void collectViaScan(std::vector<IPAddress> &found) {
+  fcntl(sock, F_SETFL, O_NONBLOCK);         // non-blocking: drain replies anytime
+
   const char *getPilot = "{\"method\":\"getPilot\",\"params\":{}}";
   const char *registration =
       "{\"method\":\"registration\",\"params\":{"
       "\"phoneMac\":\"AAAAAAAAAAAA\",\"register\":false,"
       "\"phoneIp\":\"1.2.3.4\",\"id\":\"1\"}}";
 
-  IPAddress ip   = WiFi.localIP();
+  IPAddress myip = WiFi.localIP();
   IPAddress mask = WiFi.subnetMask();
-  IPAddress net, bc;
-  for (int i = 0; i < 4; i++) {
-    net[i] = ip[i] & mask[i];
-    bc[i]  = net[i] | (~mask[i] & 0xFF);
+  uint32_t myL   = ((uint32_t)myip[0]<<24)|((uint32_t)myip[1]<<16)|((uint32_t)myip[2]<<8)|myip[3];
+  uint32_t maskL = ((uint32_t)mask[0]<<24)|((uint32_t)mask[1]<<16)|((uint32_t)mask[2]<<8)|mask[3];
+  uint32_t netL  = myL & maskL;
+  uint32_t bcL   = netL | ~maskL;
+  uint32_t hostN = bcL - netL - 1;
+  if (hostN < 1 || hostN > 1022) hostN = 254;          // default /24
+
+  IPAddress net((netL>>24)&0xFF,(netL>>16)&0xFF,(netL>>8)&0xFF,netL&0xFF);
+  Serial.printf("Local IP : %s\n", myip.toString().c_str());
+  Serial.printf("Subnet   : %s  (%u host addresses)\n", net.toString().c_str(), hostN);
+  Serial.println("Probing  : broadcast + unicast getPilot to every host ...");
+
+  uint32_t myS = (uint32_t)myip;
+
+  auto sendTo = [&](const char *msg, uint32_t s_addr) {
+    struct sockaddr_in d = wizAddr(s_addr);
+    sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&d, sizeof(d));
+  };
+
+  // Drain every reply currently queued (non-blocking). Called constantly so the
+  // small lwIP UDP receive buffer never overflows during the probe burst.
+  auto drain = [&]() {
+    char buf[2048];
+    struct sockaddr_in from; socklen_t fl;
+    while (true) {
+      fl = sizeof(from);
+      int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
+      if (n <= 0) break;                     // EWOULDBLOCK -> nothing left
+      uint32_t fs = from.sin_addr.s_addr;
+      if (fs == myS) continue;
+      bool seen = false;
+      for (auto &f : found) if ((uint32_t)f == fs) { seen = true; break; }
+      if (!seen) {
+        IPAddress fip(fs);
+        found.push_back(fip);
+        Serial.printf("  reply from %s\n", fip.toString().c_str());
+      }
+    }
+  };
+
+  // Multiple passes: a device whose probe is dropped (ARP miss / TX overflow) on
+  // one pass gets another chance on the next.
+  const int PASSES = DISCOVER_PASSES;
+  uint32_t perPassMs = (uint32_t)(timeoutSec * 1000) / PASSES;
+
+  for (int pass = 0; pass < PASSES; pass++) {
+    // broadcast (255.255.255.255 and the subnet broadcast)
+    for (uint32_t b : {(uint32_t)0xFFFFFFFF, bcL}) {
+      sendTo(registration, htonl(b));
+      sendTo(getPilot, htonl(b));
+    }
+    drain();
+
+    // unicast sweep, draining frequently so replies aren't dropped mid-burst
+    for (uint32_t h = netL + 1; h < bcL; h++) {
+      if (h == myL) continue;
+      sendTo(getPilot, htonl(h));
+      if ((h & 0x03) == 0) { drain(); delay(1); }   // drain + pace every 4 sends
+    }
+
+    // listen window for this pass
+    uint32_t endt = millis() + perPassMs;
+    while ((int32_t)(endt - millis()) > 0) { drain(); delay(5); }
+    Serial.printf("  (pass %d/%d: %d device(s) so far)\n",
+                  pass + 1, PASSES, (int)found.size());
   }
 
-  uint32_t hostBits = 0;
-  for (int i = 0; i < 4; i++)
-    hostBits += __builtin_popcount((uint8_t)(~mask[i] & 0xFF));
-  uint32_t hostCount = (hostBits >= 20) ? 0 : ((1UL << hostBits) - 1);
-  if (hostCount < 1 || hostCount > 1022) hostCount = 254;   // default to a /24
-
-  uint32_t netAddr = ((uint32_t)net[0] << 24) | ((uint32_t)net[1] << 16) |
-                     ((uint32_t)net[2] << 8) | net[3];
-
-  Serial.printf("[scan] Local IP : %s\n", ip.toString().c_str());
-  Serial.printf("[scan] Subnet   : %s  (%u host addresses)\n",
-                net.toString().c_str(), hostCount);
-  Serial.println("[scan] Probing  : broadcast + unicast getPilot to every host ...");
-
-  // 1) broadcast (works on networks that allow it)
-  for (IPAddress addr : {IPAddress(255, 255, 255, 255), bc}) {
-    wizSendRaw(addr, registration);
-    wizSendRaw(addr, getPilot);
-  }
-  drainAndLog(found);
-
-  // 2) unicast sweep (works even when broadcast is filtered)
-  int sentOk = 0, sentFail = 0;
-  for (uint32_t h = 1; h <= hostCount; h++) {
-    uint32_t a = netAddr + h;
-    IPAddress target((a >> 24) & 0xFF, (a >> 16) & 0xFF,
-                     (a >> 8) & 0xFF, a & 0xFF);
-    if (target == ip) continue;                    // skip ourselves
-    if (wizSendRaw(target, getPilot)) sentOk++; else sentFail++;
-    delay(3);                                      // pace + let ARP/replies flow
-    if (h % 16 == 0) drainAndLog(found);           // drain as we go
-  }
-  Serial.printf("[scan] probes sent ok=%d failed=%d, responders so far=%d\n",
-                sentOk, sentFail, (int)found.size());
-
-  // 3) collect replies
-  listenAndLog(found, 3000);
-  Serial.printf("[scan] Discovered %d WiZ device(s).\n", (int)found.size());
+  close(sock);
+  return found;
 }
 
-// Sweep the subnet, then create accessories for any new devices that replied.
-// Returns the number of newly added accessories.
-static int discoverAndAdd() {
-  std::vector<IPAddress> found;
-  while (wizUDP.parsePacket() > 0) wizUDP.flush();   // clear stale RX
+// report() - port of discover_wiz.py: query getSystemConfig + getPilot, print the
+// capabilities, and create the HomeKit accessory.
+static void reportAndAdd(IPAddress ip) {
+  JsonDocument cfg, pilot;
+  bool haveCfg   = wizQuery(ip, "getSystemConfig", cfg);
+  bool havePilot = wizQuery(ip, "getPilot", pilot);
 
-  collectViaScan(found);
-
-  if (found.empty()) {
-    Serial.println("[scan] zero replies from the whole subnet. Either no WiZ "
-                   "device is reachable, or 38899 traffic is blocked.");
+  Serial.println("----------------------------------------------------------------");
+  Serial.printf("Device @ %s\n", ip.toString().c_str());
+  if (!haveCfg || cfg["result"].isNull()) {
+    Serial.println("  ! getSystemConfig: no/invalid reply");
+    return;
   }
 
-  int added = 0;
-  for (auto &ip : found)
-    if (addDeviceAt(ip)) added++;
-  Serial.printf("[scan] added %d new accessory(ies) this round.\n", added);
-  return added;
+  JsonVariant r = cfg["result"];
+  String module = r["moduleName"] | "";
+  String mac    = r["mac"]        | "";
+  String fw     = r["fwVersion"]  | "";
+  String type   = detectType(module);
+  const char *caps, *hk;
+  classify(type, caps, hk);
+
+  Serial.printf("  MAC         : %s\n", mac.c_str());
+  Serial.printf("  Module      : %s\n", module.c_str());
+  Serial.printf("  Firmware    : %s\n", fw.c_str());
+  Serial.printf("  Type        : %s\n", type.c_str());
+  Serial.printf("  Capabilities: %s\n", caps);
+  Serial.printf("  HomeKit as  : %s\n", hk);
+  Serial.print  ("  Raw config  : ");
+  serializeJson(r, Serial);                 // full getSystemConfig for debugging
+  Serial.println();
+
+  if (havePilot && !pilot["result"].isNull()) {
+    JsonVariant p = pilot["result"];
+    Serial.printf("  Now         : state=%s", (p["state"] | false) ? "true" : "false");
+    if (!p["dimming"].isNull()) Serial.printf(", dimming=%d%%", (int)p["dimming"]);
+    if (!p["temp"].isNull())    Serial.printf(", temp=%dK", (int)p["temp"]);
+    if (!p["r"].isNull())       Serial.printf(", rgb=(%d,%d,%d)",
+                                              (int)p["r"], (int)p["g"], (int)p["b"]);
+    if (!p["sceneId"].isNull()) Serial.printf(", sceneId=%d", (int)p["sceneId"]);
+    Serial.println();
+  }
+
+  if (mac.length() && module.length()) {
+    if (createAccessory(ip, mac, module, type))
+      Serial.println("  -> added to HomeKit");
+    else
+      Serial.println("  -> already known");
+  }
+}
+
+// main() discovery flow - port of discover_wiz.py main(). Returns # new devices.
+static int discoverAndAdd() {
+  size_t before = knownMacs.size();
+
+  std::vector<IPAddress> found = wizDiscover(DISCOVER_TIMEOUT);
+
+  Serial.println();
+  Serial.printf("Discovered %d WiZ device(s).\n", (int)found.size());
+  std::sort(found.begin(), found.end(),
+            [](const IPAddress &a, const IPAddress &b) {
+              return ntohl((uint32_t)a) < ntohl((uint32_t)b);
+            });
+  for (auto &ip : found) reportAndAdd(ip);
+  Serial.println("----------------------------------------------------------------");
+
+  return (int)(knownMacs.size() - before);
 }
 
 // =============================================================================
@@ -479,13 +516,11 @@ bool wifiUp = false;   // set true once HomeSpan reports WiFi connected
 // actually brought the network up, so the scan would hit a dead network.
 void onWiFiConnected() {
   wifiUp = true;
-  wizUDP.begin(WIZ_PORT);   // bind UDP now that the network is alive
 
   Serial.printf("WiFi up. IP=%s  subnet=%s\n",
                 WiFi.localIP().toString().c_str(),
                 WiFi.subnetMask().toString().c_str());
 
-  Serial.println("Scanning subnet for WiZ devices (getPilot to every IP)...");
   int n = discoverAndAdd();
   Serial.printf("Total WiZ accessories: %d\n", (int)knownMacs.size());
 
@@ -502,7 +537,7 @@ void setup() {
   // skips its provisioning AP. Discovery is triggered from onWiFiConnected().
   homeSpan.setWifiCredentials(WIFI_SSID, WIFI_PASS);
   homeSpan.setPairingCode(PAIRING_CODE);
-  homeSpan.setLogLevel(1);
+  homeSpan.setLogLevel(0);   // silence HomeSpan HAP chatter so our logs are readable
   homeSpan.setWifiCallback(onWiFiConnected);
   homeSpan.begin(Category::Bridges, BRIDGE_NAME, "wiz-bridge");
 
@@ -537,14 +572,4 @@ void loop() {
     idx++;
   }
 
-  // Periodic re-discovery to pick up newly added WiZ devices at runtime.
-  static uint32_t lastScan = 0;
-  if (wifiUp && millis() - lastScan > REDISCOVER_MS) {
-    lastScan = millis();
-    int added = discoverAndAdd();
-    if (added > 0) {
-      Serial.printf("Re-scan added %d new accessory(ies); updating HomeKit DB.\n", added);
-      homeSpan.updateDatabase();   // re-announce the bridge with new accessories
-    }
-  }
 }
