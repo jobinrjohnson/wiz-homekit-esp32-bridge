@@ -1,8 +1,24 @@
 # WiZ → Apple Home Bridge (ESP32 / HomeSpan)
 
 An ESP32 firmware that **auto-discovers every Philips WiZ device on your LAN** and
-exposes each one to the **Apple Home app** natively via [HomeSpan](https://github.com/HomeSpan/HomeSpan).
-No Homebridge, no hub, no cloud — the ESP32 *is* the HomeKit bridge.
+exposes each one to the **Apple Home app** natively via
+[HomeSpan](https://github.com/HomeSpan/HomeSpan) — no Homebridge, no hub, no
+cloud. The ESP32 *is* the HomeKit bridge. It also exposes a local **magnetic reed
+switch** (door/window contact sensor) wired to a GPIO.
+
+## Features
+
+- **Zero-config WiZ discovery** — scans the whole subnet over UDP (works even on
+  routers that block broadcast).
+- **All WiZ light/plug types** — color, tunable-white, dimmable, and smart plugs.
+- **Phone-based WiFi setup** — no hardcoded credentials; provision from your
+  iPhone via a setup Wi-Fi network.
+- **Reboot-stable** — each device gets a permanent HomeKit ID derived from its
+  MAC, so names/rooms/automations survive restarts.
+- **Self-healing** — re-scans periodically; devices missed at boot or added later
+  appear automatically.
+- **Local hardware** — a reed switch on a GPIO shows up as a HomeKit Contact
+  Sensor.
 
 ## Supported accessories
 
@@ -11,81 +27,52 @@ No Homebridge, no hub, no cloud — the ESP32 *is* the HomeKit bridge.
 | Color (RGB) bulb/strip  | contains `RGB`             | Lightbulb    | On, Brightness, Hue, Saturation, ColorTemperature |
 | Tunable-white bulb      | contains `TW`              | Lightbulb    | On, Brightness, ColorTemperature                 |
 | Dimmable-white bulb     | contains `DW` (default)    | Lightbulb    | On, Brightness                                   |
-| Smart plug / socket     | contains `SOCKET`          | Outlet       | On                                               |
+| Smart plug / socket     | `SOCKET`/`PLUG`/`SWITCH`   | Outlet       | On                                               |
+| Magnetic reed switch    | local GPIO                 | ContactSensor| Open / Closed                                    |
 
-## Requirements
+## Quick start
 
-- An **ESP32** board (any dev module).
-- Arduino IDE with the **esp32 board package** (Espressif Systems) installed via Boards Manager.
-- Two libraries (Arduino IDE → *Tools → Manage Libraries…*):
-  - **HomeSpan** by Gregg E. Berman (v1.9.0+)
-  - **ArduinoJson** by Benoit Blanchon (v7.x)
-
-## Setup
-
-1. Open `WiZHomeKitBridge/WiZHomeKitBridge.ino` in the Arduino IDE.
-2. Edit the **USER CONFIG** block:
-   ```cpp
-   #define WIFI_SSID  "YOUR_WIFI_SSID"
-   #define WIFI_PASS  "YOUR_WIFI_PASSWORD"
-   ```
-3. Select your ESP32 board and port, then **Upload**.
-4. Open the Serial Monitor at **115200 baud** to watch WiFi connect and devices
-   get discovered.
-
-## Pairing with Apple Home
-
-1. Open the **Home** app → **+** → **Add Accessory**.
-2. Tap **More options…** and select **WiZ HomeKit Bridge**.
-3. Enter the setup code: **`466-37-726`** (the HomeSpan default; change it via
-   `PAIRING_CODE` in the sketch).
-4. All discovered WiZ devices appear under the single bridge.
+1. **Install** the Arduino IDE, the **esp32** board package, and the **HomeSpan**
+   + **ArduinoJson** libraries → see [docs/FLASHING.md](docs/FLASHING.md).
+2. **Flash** `WiZHomeKitBridge/WiZHomeKitBridge.ino` to your ESP32.
+3. **Provision WiFi from your phone** — join the `WiZBridge-Setup` network and
+   enter your home WiFi in the captive-portal page → see
+   [docs/WIFI-PROVISIONING.md](docs/WIFI-PROVISIONING.md).
+4. **Pair** in the Home app: Add Accessory → "More options…" → "WiZ HomeKit
+   Bridge", code **466-37-726**. All WiZ devices appear under one bridge.
 
 ## Documentation
 
-Full guides live in [`docs/`](docs/):
+Everything lives in [`docs/`](docs/):
 
-- [Flashing guide](docs/FLASHING.md) — IDE, libraries, upload, pairing.
-- [Architecture](docs/ARCHITECTURE.md) — how it all fits together.
-- [WiZ protocol reference](docs/WIZ_PROTOCOL.md) — the UDP/JSON wire format.
-- [Customization](docs/CUSTOMIZATION.md) — settings, scenes, fans, fixed IPs.
-- [Troubleshooting](docs/TROUBLESHOOTING.md) — when something won't work.
+| Doc | What's in it |
+|-----|--------------|
+| [FLASHING.md](docs/FLASHING.md) | IDE, board package, libraries, upload, serial commands |
+| [WIFI-PROVISIONING.md](docs/WIFI-PROVISIONING.md) | Phone-based WiFi setup (SoftAP), re-provisioning |
+| [HARDWARE.md](docs/HARDWARE.md) | Reed-switch wiring, GPIO guidance, adding more sensors |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the firmware is structured, data flow |
+| [DISCOVERY.md](docs/DISCOVERY.md) | The subnet-scan discovery + the `discover_wiz.py` tool |
+| [WIZ_PROTOCOL.md](docs/WIZ_PROTOCOL.md) | WiZ local UDP/JSON protocol reference |
+| [STABLE-IDS.md](docs/STABLE-IDS.md) | Why/how device IDs stay stable across reboots |
+| [CUSTOMIZATION.md](docs/CUSTOMIZATION.md) | All tunable settings and how to extend |
+| [LIMITATIONS.md](docs/LIMITATIONS.md) | Energy monitoring, WiZ scenes, HomeKit service types |
+| [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | When something won't work |
 
-## How it works
+## Repository layout
 
-- **Discovery** — two methods are used automatically: (1) a UDP `registration`
-  **broadcast** on port `38899`, and (2) an **active unicast sweep** that pings
-  every host on the local subnet. The sweep needs no broadcast, so devices are
-  found even on routers/mesh systems that filter broadcast (the usual cause of
-  "no devices found"). Each responder is queried with `getSystemConfig` to read
-  its `moduleName` and MAC, which determines the HomeKit type.
-- **Control** — Home-app changes trigger `update()`, which sends a WiZ
-  `setPilot` command (state / dimming / temp / r,g,b).
-- **Sync** — a round-robin poller calls `getPilot` on one device every
-  ~2.5 s and pushes external changes (e.g. the WiZ app or a physical switch)
-  back into HomeKit.
-- **Runtime additions** — the network is re-scanned every 5 minutes; brand-new
-  WiZ devices are added live via `homeSpan.updateDatabase()`.
-
-## Tuning (top of the `.ino`)
-
-| Macro            | Meaning                                             |
-|------------------|-----------------------------------------------------|
-| `MIN_BRIGHTNESS` | WiZ dimming floor (WiZ valid range is 10–100).      |
-| `POLL_STEP_MS`   | Gap between polling successive devices.              |
-| `REDISCOVER_MS`  | How often to re-scan for newly added devices.       |
-| `WIZ_TIMEOUT_MS` | Per-request UDP response timeout.                   |
-| `PAIRING_CODE`   | 8-digit HomeKit setup code.                         |
-
-## Troubleshooting
-
-- **No devices found** — ESP32 and WiZ devices must be on the **same subnet /
-  VLAN**, and the bulbs must already work in the official WiZ app. Some
-  routers/APs block broadcast traffic (check "AP/client isolation").
-- **Colors look off** — WiZ RGB bulbs separate color vs. tunable-white modes;
-  picking a color sends RGB, the temperature slider sends Kelvin. This is
-  expected HomeKit/WiZ behavior.
-- **Re-pair after big changes** — if you remove devices and want them gone from
-  Home immediately, reset the ESP32's HomeKit pairing (HomeSpan CLI `H` over
-  serial) and re-add the bridge.
 ```
+homespan/
+├── README.md
+├── discover_wiz.py                 # desktop tool: find WiZ devices + capabilities
+├── docs/                           # all documentation
+└── WiZHomeKitBridge/
+    └── WiZHomeKitBridge.ino        # the ESP32 firmware
+```
+
+## Requirements
+
+- An **ESP32** dev board (2.4 GHz WiFi only).
+- Arduino IDE + **esp32** board package (Espressif).
+- Libraries: **HomeSpan** (≥ 2.0) and **ArduinoJson** (v7.x).
+- WiZ devices on the **same subnet** as the ESP32 (they must already work in the
+  official WiZ app).
