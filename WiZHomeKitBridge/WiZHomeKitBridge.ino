@@ -116,12 +116,18 @@ static bool wizRequest(IPAddress ip, const char *json, JsonDocument &doc,
   return false;
 }
 
+// Fire-and-forget raw JSON to a device (or broadcast) on the WiZ port.
+// Returns true if the packet was queued for sending.
+static bool wizSendRaw(IPAddress ip, const char *json) {
+  if (!wizUDP.beginPacket(ip, WIZ_PORT)) return false;
+  wizUDP.write((const uint8_t *)json, strlen(json));
+  return wizUDP.endPacket() == 1;
+}
+
 // Fire-and-forget setPilot (control) command.
 static void wizSetPilot(IPAddress ip, const String &params) {
   String json = String("{\"method\":\"setPilot\",\"params\":{") + params + "}}";
-  wizUDP.beginPacket(ip, WIZ_PORT);
-  wizUDP.write((const uint8_t *)json.c_str(), json.length());
-  wizUDP.endPacket();
+  wizSendRaw(ip, json.c_str());
 }
 
 // ---- Pollable interface (so we can store lights & outlets together) ---------
@@ -315,9 +321,17 @@ static bool addDeviceAt(IPAddress ip) {
   String type = detectType(moduleName);
   String name = friendlyName(type, mac);
 
-  Serial.printf("  + ADDED %s  ip=%s  mac=%s  module=%s  type=%s\n",
-                name.c_str(), ip.toString().c_str(), mac.c_str(),
-                moduleName.c_str(), type.c_str());
+  const char *caps, *hk;
+  if      (type == "SOCKET") { caps = "on/off";                                          hk = "Outlet"; }
+  else if (type == "RGB")    { caps = "on/off, brightness, color (RGB), tunable white";  hk = "Lightbulb (color)"; }
+  else if (type == "TW")     { caps = "on/off, brightness, tunable white (CCT)";         hk = "Lightbulb (white)"; }
+  else                       { caps = "on/off, brightness";                              hk = "Lightbulb (dimmable)"; }
+
+  Serial.printf("  + ADDED %s  ip=%s\n", name.c_str(), ip.toString().c_str());
+  Serial.printf("      mac=%s  module=%s  type=%s\n",
+                mac.c_str(), moduleName.c_str(), type.c_str());
+  Serial.printf("      capabilities=%s\n", caps);
+  Serial.printf("      HomeKit as=%s\n", hk);
 
   new SpanAccessory();
     new Service::AccessoryInformation();
@@ -376,19 +390,26 @@ static void listenAndLog(std::vector<IPAddress> &found, uint32_t windowMs) {
   }
 }
 
-// Discovery: enumerate every IP on the local subnet, send a getPilot to each
-// (this probes whether a device exists AND that UDP:38899 is open), and collect
-// the IPs that reply. No broadcast, so it works through broadcast-filtering APs.
-// PASSES > 1 because the first unicast to an un-ARP'd host is often dropped while
-// ARP resolves; a second pass reaches devices the first one missed.
+// Discovery - same logic as discover_wiz.py:
+//   1. send getPilot (+ a registration probe) to the broadcast address
+//   2. send a unicast getPilot to every host on the subnet
+//   3. collect every IP that replies (only real WiZ devices answer on 38899)
+// On the ESP32 we also drain replies *during* the sweep, because its small UDP
+// receive buffer would otherwise overflow while we blast out probes.
 static void collectViaScan(std::vector<IPAddress> &found) {
-  const char *probe = "{\"method\":\"getPilot\",\"params\":{}}";
-  const int   PASSES = 2;
+  const char *getPilot = "{\"method\":\"getPilot\",\"params\":{}}";
+  const char *registration =
+      "{\"method\":\"registration\",\"params\":{"
+      "\"phoneMac\":\"AAAAAAAAAAAA\",\"register\":false,"
+      "\"phoneIp\":\"1.2.3.4\",\"id\":\"1\"}}";
 
   IPAddress ip   = WiFi.localIP();
   IPAddress mask = WiFi.subnetMask();
-  IPAddress net;
-  for (int i = 0; i < 4; i++) net[i] = ip[i] & mask[i];
+  IPAddress net, bc;
+  for (int i = 0; i < 4; i++) {
+    net[i] = ip[i] & mask[i];
+    bc[i]  = net[i] | (~mask[i] & 0xFF);
+  }
 
   uint32_t hostBits = 0;
   for (int i = 0; i < 4; i++)
@@ -399,34 +420,35 @@ static void collectViaScan(std::vector<IPAddress> &found) {
   uint32_t netAddr = ((uint32_t)net[0] << 24) | ((uint32_t)net[1] << 16) |
                      ((uint32_t)net[2] << 8) | net[3];
 
-  Serial.printf("[scan] my IP=%s mask=%s -> network %s, probing %u hosts, %d passes\n",
-                ip.toString().c_str(), mask.toString().c_str(),
-                net.toString().c_str(), hostCount, PASSES);
+  Serial.printf("[scan] Local IP : %s\n", ip.toString().c_str());
+  Serial.printf("[scan] Subnet   : %s  (%u host addresses)\n",
+                net.toString().c_str(), hostCount);
+  Serial.println("[scan] Probing  : broadcast + unicast getPilot to every host ...");
 
-  for (int pass = 1; pass <= PASSES; pass++) {
-    int sentOk = 0, sentFail = 0;
-    for (uint32_t h = 1; h <= hostCount; h++) {
-      uint32_t a = netAddr + h;
-      IPAddress target((a >> 24) & 0xFF, (a >> 16) & 0xFF,
-                       (a >> 8) & 0xFF, a & 0xFF);
-      if (target == ip) continue;                  // skip ourselves
-
-      int ok = 0;
-      if (wizUDP.beginPacket(target, WIZ_PORT)) {
-        wizUDP.write((const uint8_t *)probe, strlen(probe));
-        ok = wizUDP.endPacket();                   // 1 = queued, 0 = send failed
-      }
-      if (ok) sentOk++; else sentFail++;
-
-      delay(3);                                    // pace + let ARP/replies flow
-      if (h % 16 == 0) drainAndLog(found);         // collect replies as we go
-    }
-    Serial.printf("[scan] pass %d/%d: probes sent ok=%d failed=%d, responders so far=%d\n",
-                  pass, PASSES, sentOk, sentFail, (int)found.size());
-    listenAndLog(found, 1500);                     // listen after each pass
+  // 1) broadcast (works on networks that allow it)
+  for (IPAddress addr : {IPAddress(255, 255, 255, 255), bc}) {
+    wizSendRaw(addr, registration);
+    wizSendRaw(addr, getPilot);
   }
+  drainAndLog(found);
 
-  Serial.printf("[scan] finished: %d WiZ responder(s)\n", (int)found.size());
+  // 2) unicast sweep (works even when broadcast is filtered)
+  int sentOk = 0, sentFail = 0;
+  for (uint32_t h = 1; h <= hostCount; h++) {
+    uint32_t a = netAddr + h;
+    IPAddress target((a >> 24) & 0xFF, (a >> 16) & 0xFF,
+                     (a >> 8) & 0xFF, a & 0xFF);
+    if (target == ip) continue;                    // skip ourselves
+    if (wizSendRaw(target, getPilot)) sentOk++; else sentFail++;
+    delay(3);                                      // pace + let ARP/replies flow
+    if (h % 16 == 0) drainAndLog(found);           // drain as we go
+  }
+  Serial.printf("[scan] probes sent ok=%d failed=%d, responders so far=%d\n",
+                sentOk, sentFail, (int)found.size());
+
+  // 3) collect replies
+  listenAndLog(found, 3000);
+  Serial.printf("[scan] Discovered %d WiZ device(s).\n", (int)found.size());
 }
 
 // Sweep the subnet, then create accessories for any new devices that replied.
