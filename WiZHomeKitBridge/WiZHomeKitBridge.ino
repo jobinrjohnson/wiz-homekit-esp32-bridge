@@ -50,6 +50,15 @@
 #define BRIDGE_NAME "WiZ HomeKit Bridge"
 #define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726
 
+// --- Magnetic reed switch (door/window contact sensor) ----------------------
+// Wire the reed switch between REED_PIN and GND. The internal pull-up is used,
+// so when the magnet is present the reed closes and pulls the pin LOW.
+// Pick an input-capable GPIO WITH a usable pull-up (avoid 34-39 which have none,
+// and avoid strapping/flash pins 0,2,6-11,15). GPIO 23 is a safe default.
+#define REED_PIN          23             // GPIO the reed switch is wired to
+#define REED_NAME         "Door Sensor"  // name shown in the Home app
+#define REED_ACTIVE_LOW   true           // true: magnet present -> pin LOW -> "closed"
+
 #define WIZ_PORT          38899          // WiZ UDP control port (devices listen here)
 #define MIN_BRIGHTNESS    10             // WiZ dimming floor (valid range 10-100)
 #define POLL_STEP_MS      2500           // poll one device every this many ms (round-robin)
@@ -271,6 +280,45 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
     if (res.isNull() || res["state"].isNull()) return;
     bool st = res["state"];
     if (power->getVal<bool>() != st) power->setVal(st);
+  }
+};
+
+// =============================================================================
+// HomeKit Contact Sensor backed by a magnetic reed switch on a GPIO
+// =============================================================================
+struct ReedSensor : Service::ContactSensor {
+  uint8_t pin;
+  bool    activeLow;
+  SpanCharacteristic *contact;
+  int      stableRaw, lastRaw;
+  uint32_t lastEdge = 0;
+
+  ReedSensor(uint8_t pin, bool activeLow = true)
+      : Service::ContactSensor(), pin(pin), activeLow(activeLow) {
+    pinMode(pin, INPUT_PULLUP);
+    stableRaw = lastRaw = digitalRead(pin);
+    contact = new Characteristic::ContactSensorState(stateFrom(stableRaw));
+  }
+
+  // HomeKit ContactSensorState: 0 = contact detected (closed), 1 = open.
+  uint8_t stateFrom(int raw) {
+    bool closed = activeLow ? (raw == LOW) : (raw == HIGH);
+    return closed ? 0 : 1;
+  }
+
+  // Polled automatically by HomeSpan; debounced ~30ms.
+  void loop() override {
+    int raw = digitalRead(pin);
+    if (raw != lastRaw) { lastRaw = raw; lastEdge = millis(); }
+    if (raw != stableRaw && millis() - lastEdge > 30) {
+      stableRaw = raw;
+      uint8_t s = stateFrom(raw);
+      if (contact->getVal() != s) {
+        contact->setVal(s);
+        Serial.printf("[reed] pin %d -> %s\n", pin,
+                      s == 0 ? "CLOSED (contact detected)" : "OPEN");
+      }
+    }
   }
 };
 
@@ -550,6 +598,17 @@ void setup() {
       new Characteristic::Manufacturer("WiZ");
       new Characteristic::Model("ESP32-WiZ-Bridge");
       new Characteristic::FirmwareRevision("1.0");
+
+  // Local hardware: magnetic reed switch -> HomeKit Contact Sensor.
+  new SpanAccessory();
+    new Service::AccessoryInformation();
+      new Characteristic::Identify();
+      new Characteristic::Name(REED_NAME);
+      new Characteristic::Manufacturer("DIY");
+      new Characteristic::SerialNumber("reed-1");
+      new Characteristic::Model("ReedSwitch");
+      new Characteristic::FirmwareRevision("1.0");
+    new ReedSensor(REED_PIN, REED_ACTIVE_LOW);
 }
 
 void loop() {
