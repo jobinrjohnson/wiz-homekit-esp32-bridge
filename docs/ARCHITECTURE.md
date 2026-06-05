@@ -35,25 +35,44 @@ WiZ devices.
 5. Discovery does **not** run here — it's deferred to the WiFi callback, because
    the network isn't up yet during `setup()`.
 
-## WiFi-connected callback (`onWiFiConnected`)
+## Concurrency: a dedicated WiZ task on core 0
 
-HomeSpan calls this **once WiFi is actually connected**. Only then is it safe to
-do UDP. It runs discovery (`discoverAndAdd()`), and if any new device was added,
-calls `homeSpan.updateDatabase()` to publish them.
+This is the key design decision. **All blocking WiZ UDP** (the discovery scan and
+per-device `getPilot` polling) runs in its own FreeRTOS task **pinned to core 0**,
+created in `setup()` (`wizTaskFn`). `homeSpan.poll()` runs in `loop()` on core 1
+and is **never blocked** by UDP timeouts or scans — which is what prevents the
+"No Response" stalls (HomeKit drops a bridge whose `poll()` isn't serviced
+frequently).
+
+```
+core 0  ── wizTaskFn ──►  discovery scan + round-robin getPilot   (blocking UDP)
+                              │ produces results
+                              ▼  (thread-safe queues, guarded by wizMux)
+core 1  ── loop() ─────►  homeSpan.poll() + drainWizResults()      (HomeKit only)
+```
+
+**All HomeSpan mutations stay on core 1 / the main thread.** The task never calls
+`setVal()` or creates accessories; it only fills queues:
+
+- `pollQ` — `PollResult`s from polling → main loop applies via `applyPilot()`.
+- `discQ` — `DiscResult`s from discovery → main loop creates new accessories /
+  refreshes IPs, then calls `updateDatabase()` once per batch.
+- `deviceAddrs` — the `mac→ip` poll-target list the loop fills and the task reads.
+
+`onWiFiConnected` just sets `wifiUp`; the task waits on that flag, then does the
+initial scan and settles into: quick re-scans (every 30 s for ~2 min) then every
+`REDISCOVER_MS`, polling one device per `POLL_STEP_MS` in between.
 
 ## Main loop (`loop()`)
 
 ```
-homeSpan.poll();                 // service HAP traffic every iteration
-├─ heartbeat                     // print device count every 15s
-├─ round-robin poll one device   // every POLL_STEP_MS (2.5s)
-└─ background re-discovery        // quick first ~2 min, then every REDISCOVER_MS
+homeSpan.poll();        // HAP traffic - never blocked
+drainWizResults();      // apply queued state updates / new devices (main thread)
+heartbeat;              // device count every 15s
 ```
 
-- **Round-robin polling** keeps UDP blocking minimal: one `getPilot` per
-  `POLL_STEP_MS`, so HAP stays responsive with many devices.
-- **Background re-discovery** uses a lighter scan (2 s, single pass) so it doesn't
-  stall HAP; it catches devices missed at boot or added later.
+Control (`setPilot`) stays on the main thread inside `update()` — it's a quick
+fire-and-forget `sendto`, so it doesn't need the task.
 
 ## Control path (Home → WiZ)
 

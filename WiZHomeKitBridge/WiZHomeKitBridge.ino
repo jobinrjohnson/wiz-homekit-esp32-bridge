@@ -74,6 +74,42 @@
 #define DISCOVER_PASSES   3              // sweep the subnet this many times
 // =============================================================================
 
+// ---- Thread-safe handoff: WiZ task (core 0)  <->  HomeSpan (loop, core 1) -----
+// The WiZ task does ALL blocking UDP (discovery + polling) so it can never starve
+// homeSpan.poll(). It produces results into these queues; the main loop applies
+// them to HomeKit. ALL HomeSpan mutations (setVal / new accessory / updateDatabase)
+// stay on the main thread. Defined here, ABOVE the first function, so Arduino's
+// auto-generated prototypes can see these types.
+struct PollResult {              // one getPilot result, produced by the task
+  String mac;
+  bool   reachable = false;
+  bool   state = false;
+  int    dimming = -1, temp = -1, r = -1, g = -1, b = -1;   // -1 = field absent
+};
+struct DiscResult {             // one discovered device, produced by the task
+  String    mac, type, module;
+  IPAddress ip;
+};
+struct DeviceAddr {             // mac -> ip the task uses as poll targets
+  String    mac;
+  IPAddress ip;
+};
+
+volatile bool            wifiUp = false;  // set true once WiFi is connected
+SemaphoreHandle_t        wizMux;          // guards the three vectors below
+std::vector<PollResult>  pollQ;           // task -> loop
+std::vector<DiscResult>  discQ;           // task -> loop
+std::vector<DeviceAddr>  deviceAddrs;     // loop -> task (poll targets)
+
+// ---- Pollable interface (so we can store lights & outlets together) ---------
+struct WiZPollable {
+  virtual void   setIp(IPAddress ip) = 0;
+  virtual String macAddr() = 0;
+  virtual void   applyPilot(const PollResult &p) = 0;   // applied on main thread
+};
+std::vector<WiZPollable *> pollables;     // main thread only
+std::vector<String>        knownMacs;     // dedupe (main thread only)
+
 // ---- HSV <-> RGB helpers ----------------------------------------------------
 static void hsv2rgb(double H, double S, double V, int &R, int &G, int &B) {
   S /= 100.0; V /= 100.0;
@@ -162,18 +198,16 @@ static void wizSetPilot(IPAddress ip, const String &params) {
   wizSendRaw(ip, json.c_str());
 }
 
-// ---- Pollable interface (so we can store lights & outlets together) ---------
-struct WiZPollable {
-  virtual void pollState() = 0;
-};
-std::vector<WiZPollable *> pollables;
-std::vector<String>        knownMacs;     // dedupe across re-scans
+// (WiZ task <-> HomeSpan shared types + the WiZPollable interface are defined
+//  near the top of the file, right after USER CONFIG, so that Arduino's
+//  auto-generated function prototypes can see them.)
 
 // =============================================================================
 // HomeKit Lightbulb backed by a WiZ bulb
 // =============================================================================
 struct WiZLight : Service::LightBulb, WiZPollable {
   IPAddress ip;
+  String mac;
   bool hasColor, hasCCT;
   SpanCharacteristic *power;
   SpanCharacteristic *bright = nullptr;
@@ -181,8 +215,11 @@ struct WiZLight : Service::LightBulb, WiZPollable {
   SpanCharacteristic *sat    = nullptr;
   SpanCharacteristic *cct    = nullptr;
 
-  WiZLight(IPAddress ip, bool hasColor, bool hasCCT)
-      : Service::LightBulb(), ip(ip), hasColor(hasColor), hasCCT(hasCCT) {
+  void   setIp(IPAddress n) override { ip = n; }
+  String macAddr() override { return mac; }
+
+  WiZLight(IPAddress ip, const String &mac, bool hasColor, bool hasCCT)
+      : Service::LightBulb(), ip(ip), mac(mac), hasColor(hasColor), hasCCT(hasCCT) {
     power  = new Characteristic::On(false);
     bright = (new Characteristic::Brightness(100))->setRange(1, 100, 1);
     if (hasColor) {
@@ -231,32 +268,19 @@ struct WiZLight : Service::LightBulb, WiZPollable {
     return true;
   }
 
-  // Round-robin pull of the real bulb state back into HomeKit.
-  void pollState() override {
-    JsonDocument doc;
-    if (!wizQuery(ip, "getPilot", doc)) return;
-    JsonVariant res = doc["result"];
-    if (res.isNull()) return;
-
-    if (!res["state"].isNull()) {
-      bool st = res["state"];
-      if (power->getVal<bool>() != st) power->setVal(st);
+  // Apply a getPilot result fetched by the WiZ task. Runs on the MAIN thread.
+  void applyPilot(const PollResult &p) override {
+    if (!p.reachable) return;
+    if (power->getVal<bool>() != p.state) power->setVal(p.state);
+    if (bright && p.dimming > 0 && bright->getVal() != p.dimming)
+      bright->setVal(p.dimming);
+    if (cct && p.temp > 0) {
+      int m = constrain(1000000 / p.temp, 153, 454);
+      if (cct->getVal() != m) cct->setVal(m);
     }
-    if (bright && !res["dimming"].isNull()) {
-      int dm = res["dimming"];
-      if (dm > 0 && bright->getVal() != dm) bright->setVal(dm);
-    }
-    if (cct && !res["temp"].isNull()) {
-      int k = res["temp"];
-      if (k > 0) {
-        int m = constrain(1000000 / k, 153, 454);
-        if (cct->getVal() != m) cct->setVal(m);
-      }
-    }
-    if (hue && !res["r"].isNull()) {
-      int R = res["r"] | 0, G = res["g"] | 0, B = res["b"] | 0;
+    if (hue && p.r >= 0) {
       double H, S, V;
-      rgb2hsv(R, G, B, H, S, V);
+      rgb2hsv(p.r, p.g, p.b, H, S, V);
       hue->setVal(H);
       sat->setVal(S);
     }
@@ -268,9 +292,13 @@ struct WiZLight : Service::LightBulb, WiZPollable {
 // =============================================================================
 struct WiZOutlet : Service::Outlet, WiZPollable {
   IPAddress ip;
+  String mac;
   SpanCharacteristic *power;
 
-  WiZOutlet(IPAddress ip) : Service::Outlet(), ip(ip) {
+  void   setIp(IPAddress n) override { ip = n; }
+  String macAddr() override { return mac; }
+
+  WiZOutlet(IPAddress ip, const String &mac) : Service::Outlet(), ip(ip), mac(mac) {
     power = new Characteristic::On(false);
     new Characteristic::OutletInUse(true);
   }
@@ -280,13 +308,9 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
     return true;
   }
 
-  void pollState() override {
-    JsonDocument doc;
-    if (!wizQuery(ip, "getPilot", doc)) return;
-    JsonVariant res = doc["result"];
-    if (res.isNull() || res["state"].isNull()) return;
-    bool st = res["state"];
-    if (power->getVal<bool>() != st) power->setVal(st);
+  void applyPilot(const PollResult &p) override {
+    if (!p.reachable) return;
+    if (power->getVal<bool>() != p.state) power->setVal(p.state);
   }
 };
 
@@ -394,13 +418,17 @@ static bool createAccessory(IPAddress ip, const String &mac,
       new Characteristic::FirmwareRevision("1.0");
 
   if (type == "SOCKET") {
-    pollables.push_back(new WiZOutlet(ip));
+    pollables.push_back(new WiZOutlet(ip, mac));
   } else {
     bool color = (type == "RGB");
     bool cct   = (type == "RGB" || type == "TW");
-    pollables.push_back(new WiZLight(ip, color, cct));
+    pollables.push_back(new WiZLight(ip, mac, color, cct));
   }
   knownMacs.push_back(mac);
+
+  xSemaphoreTake(wizMux, portMAX_DELAY);   // register as a poll target for the task
+  deviceAddrs.push_back({mac, ip});
+  xSemaphoreGive(wizMux);
   return true;
 }
 
@@ -504,94 +532,151 @@ static std::vector<IPAddress> wizDiscover(float timeoutSec, int passes) {
   return found;
 }
 
-// report() - port of discover_wiz.py: query getSystemConfig + getPilot, print the
-// capabilities, and create the HomeKit accessory.
-static void reportAndAdd(IPAddress ip) {
-  JsonDocument cfg, pilot;
-  bool haveCfg   = wizQuery(ip, "getSystemConfig", cfg);
-  bool havePilot = wizQuery(ip, "getPilot", pilot);
+// Parse a getPilot "result" object into a PollResult.
+static void parsePilot(JsonVariant res, PollResult &pr) {
+  if (res.isNull()) return;
+  pr.reachable = true;
+  pr.state = res["state"] | false;
+  if (!res["dimming"].isNull()) pr.dimming = res["dimming"];
+  if (!res["temp"].isNull())    pr.temp    = res["temp"];
+  if (!res["r"].isNull()) { pr.r = res["r"] | 0; pr.g = res["g"] | 0; pr.b = res["b"] | 0; }
+}
 
-  Serial.println("----------------------------------------------------------------");
-  Serial.printf("Device @ %s\n", ip.toString().c_str());
-  if (!haveCfg || cfg["result"].isNull()) {
-    Serial.println("  ! getSystemConfig: no/invalid reply");
-    return;
-  }
+// [TASK] Query one responder (getSystemConfig + getPilot) and append the device
+// + its initial state to the round's local batches. Runs on the WiZ task.
+static void taskReport(IPAddress ip, std::vector<DiscResult> &dOut,
+                       std::vector<PollResult> &pOut) {
+  JsonDocument cfg, pilot;
+  bool haveCfg   = wizQuery(ip, "getSystemConfig", cfg, 1.0f);
+  bool havePilot = wizQuery(ip, "getPilot", pilot, 1.0f);
+  if (!haveCfg || cfg["result"].isNull()) return;
 
   JsonVariant r = cfg["result"];
   String module = r["moduleName"] | "";
   String mac    = r["mac"]        | "";
-  String fw     = r["fwVersion"]  | "";
-  String type   = detectType(module);
-  const char *caps, *hk;
-  classify(type, caps, hk);
+  if (!mac.length() || !module.length()) return;
+  String type = detectType(module);
 
-  Serial.printf("  MAC         : %s\n", mac.c_str());
-  Serial.printf("  Module      : %s\n", module.c_str());
-  Serial.printf("  Firmware    : %s\n", fw.c_str());
-  Serial.printf("  Type        : %s\n", type.c_str());
-  Serial.printf("  Capabilities: %s\n", caps);
-  Serial.printf("  HomeKit as  : %s\n", hk);
-  Serial.print  ("  Raw config  : ");
-  serializeJson(r, Serial);                 // full getSystemConfig for debugging
-  Serial.println();
+  Serial.printf("Device @ %s  mac=%s  module=%s  type=%s\n",
+                ip.toString().c_str(), mac.c_str(), module.c_str(), type.c_str());
 
-  if (havePilot && !pilot["result"].isNull()) {
-    JsonVariant p = pilot["result"];
-    Serial.printf("  Now         : state=%s", (p["state"] | false) ? "true" : "false");
-    if (!p["dimming"].isNull()) Serial.printf(", dimming=%d%%", (int)p["dimming"]);
-    if (!p["temp"].isNull())    Serial.printf(", temp=%dK", (int)p["temp"]);
-    if (!p["r"].isNull())       Serial.printf(", rgb=(%d,%d,%d)",
-                                              (int)p["r"], (int)p["g"], (int)p["b"]);
-    if (!p["sceneId"].isNull()) Serial.printf(", sceneId=%d", (int)p["sceneId"]);
-    Serial.println();
-  }
+  dOut.push_back({mac, type, module, ip});
+  PollResult pr; pr.mac = mac;
+  if (havePilot) parsePilot(pilot["result"], pr);
+  pOut.push_back(pr);
+}
 
-  if (mac.length() && module.length()) {
-    if (createAccessory(ip, mac, module, type))
-      Serial.println("  -> added to HomeKit");
-    else
-      Serial.println("  -> already known");
+// [TASK] One discovery round: sweep, query each responder, push the whole batch
+// to the main thread in a single locked handoff (one updateDatabase per round).
+static void taskDiscoverRound(float timeoutSec, int passes) {
+  std::vector<IPAddress> found = wizDiscover(timeoutSec, passes);
+  Serial.printf("Discovered %d WiZ device(s).\n", (int)found.size());
+  std::sort(found.begin(), found.end(), [](const IPAddress &a, const IPAddress &b) {
+    return ntohl((uint32_t)a) < ntohl((uint32_t)b);
+  });
+
+  std::vector<DiscResult> dList;
+  std::vector<PollResult> pList;
+  for (auto &ip : found) taskReport(ip, dList, pList);
+
+  if (!dList.empty() || !pList.empty()) {
+    xSemaphoreTake(wizMux, portMAX_DELAY);
+    for (auto &d : dList) discQ.push_back(d);
+    for (auto &p : pList) pollQ.push_back(p);
+    xSemaphoreGive(wizMux);
   }
 }
 
-// main() discovery flow - port of discover_wiz.py main(). Returns # new devices.
-static int discoverAndAdd(float timeoutSec = DISCOVER_TIMEOUT,
-                          int passes = DISCOVER_PASSES) {
-  size_t before = knownMacs.size();
+// [TASK] Poll one device's current state and hand it to the main thread.
+static void pollOne(const DeviceAddr &d) {
+  JsonDocument doc;
+  PollResult pr; pr.mac = d.mac;
+  if (wizQuery(d.ip, "getPilot", doc, 0.6f)) parsePilot(doc["result"], pr);
+  if (pr.reachable) {
+    xSemaphoreTake(wizMux, portMAX_DELAY);
+    pollQ.push_back(pr);
+    xSemaphoreGive(wizMux);
+  }
+}
 
-  std::vector<IPAddress> found = wizDiscover(timeoutSec, passes);
+// [TASK] Entry point - pinned to core 0. ALL blocking UDP lives here so the main
+// loop's homeSpan.poll() (core 1) is never starved.
+static void wizTaskFn(void *) {
+  while (!wifiUp) vTaskDelay(pdMS_TO_TICKS(200));
+  vTaskDelay(pdMS_TO_TICKS(500));
 
-  Serial.println();
-  Serial.printf("Discovered %d WiZ device(s).\n", (int)found.size());
-  std::sort(found.begin(), found.end(),
-            [](const IPAddress &a, const IPAddress &b) {
-              return ntohl((uint32_t)a) < ntohl((uint32_t)b);
-            });
-  for (auto &ip : found) reportAndAdd(ip);
-  Serial.println("----------------------------------------------------------------");
+  taskDiscoverRound(DISCOVER_TIMEOUT, DISCOVER_PASSES);   // initial scan
 
-  return (int)(knownMacs.size() - before);
+  uint32_t lastScan = millis();
+  int      quick = 4;            // first 4 re-scans are 30s apart, then REDISCOVER_MS
+  size_t   idx = 0;
+
+  for (;;) {
+    uint32_t interval = (quick > 0) ? 30000UL : REDISCOVER_MS;
+    if (millis() - lastScan > interval) {
+      lastScan = millis();
+      if (quick > 0) quick--;
+      taskDiscoverRound(2.0f, 1);                          // light background scan
+    }
+
+    DeviceAddr d; bool have = false;
+    xSemaphoreTake(wizMux, portMAX_DELAY);
+    if (!deviceAddrs.empty()) {
+      if (idx >= deviceAddrs.size()) idx = 0;
+      d = deviceAddrs[idx++];
+      have = true;
+    }
+    xSemaphoreGive(wizMux);
+    if (have) pollOne(d);
+
+    vTaskDelay(pdMS_TO_TICKS(POLL_STEP_MS));
+  }
+}
+
+// [MAIN] find a service by MAC (only the main thread touches `pollables`).
+static WiZPollable *pollableForMac(const String &mac) {
+  for (auto *p : pollables) if (p->macAddr() == mac) return p;
+  return nullptr;
+}
+
+// [MAIN] Apply the task's queued results to HomeKit. MUST run on the main thread.
+static void drainWizResults() {
+  // poll results -> setVal
+  std::vector<PollResult> pr;
+  xSemaphoreTake(wizMux, portMAX_DELAY); pr.swap(pollQ); xSemaphoreGive(wizMux);
+  for (auto &p : pr) {
+    WiZPollable *s = pollableForMac(p.mac);
+    if (s) s->applyPilot(p);
+  }
+
+  // discovery results -> refresh IP (known) or create accessory (new)
+  std::vector<DiscResult> dr;
+  xSemaphoreTake(wizMux, portMAX_DELAY); dr.swap(discQ); xSemaphoreGive(wizMux);
+  bool need = false;
+  for (auto &d : dr) {
+    bool known = false;
+    for (auto &m : knownMacs) if (m == d.mac) { known = true; break; }
+    if (known) {
+      if (WiZPollable *s = pollableForMac(d.mac)) s->setIp(d.ip);
+      xSemaphoreTake(wizMux, portMAX_DELAY);
+      for (auto &da : deviceAddrs) if (da.mac == d.mac) { da.ip = d.ip; break; }
+      xSemaphoreGive(wizMux);
+    } else if (createAccessory(d.ip, d.mac, d.module, d.type)) {
+      need = true;
+      Serial.printf("[WiZ] added %s (%s)\n", d.mac.c_str(), d.type.c_str());
+    }
+  }
+  if (need) homeSpan.updateDatabase();
 }
 
 // =============================================================================
-bool wifiUp = false;   // set true once HomeSpan reports WiFi connected
-
-// Called by HomeSpan ONCE the WiFi connection is fully established. This is the
-// only safe place to do UDP work - doing it in setup() runs before HomeSpan has
-// actually brought the network up, so the scan would hit a dead network.
+// Called by HomeSpan once WiFi connects. Just flips `wifiUp` - the WiZ task is
+// waiting on it and then drives all discovery/polling off the main thread.
 void onWiFiConnected() {
   wifiUp = true;
-
   Serial.printf("WiFi up. IP=%s  subnet=%s\n",
                 WiFi.localIP().toString().c_str(),
                 WiFi.subnetMask().toString().c_str());
-
-  int n = discoverAndAdd();
-  Serial.printf("Total WiZ accessories: %d\n", (int)knownMacs.size());
-
-  if (n > 0)
-    homeSpan.updateDatabase();   // publish the freshly-found accessories
 }
 
 void setup() {
@@ -629,44 +714,24 @@ void setup() {
       new Characteristic::Model("ReedSwitch");
       new Characteristic::FirmwareRevision("1.0");
     new ReedSensor(REED_PIN, REED_ACTIVE_LOW);
+
+  // Start the WiZ I/O task on core 0. ALL blocking UDP (discovery + polling) runs
+  // there, so homeSpan.poll() on the main loop (core 1) is never blocked - this is
+  // what prevents the "No Response" stalls.
+  wizMux = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(wizTaskFn, "wizTask", 10240, NULL, 1, NULL, 0);
 }
 
 void loop() {
-  homeSpan.poll();
+  homeSpan.poll();          // never blocked - all WiZ UDP is on the core-0 task
 
-  // Heartbeat: print the current bridged-device count every 15s so the result
-  // of discovery is always visible at the tail of the serial log.
+  // Apply whatever the WiZ task has produced (state updates / new devices).
+  drainWizResults();
+
+  // Heartbeat so the device count is always visible at the tail of the log.
   static uint32_t lastBeat = 0;
   if (millis() - lastBeat > 15000) {
     lastBeat = millis();
     Serial.printf("[WiZ] bridged devices: %d\n", (int)knownMacs.size());
-  }
-
-  // Round-robin state polling: one device per POLL_STEP_MS to avoid blocking.
-  static uint32_t lastPoll = 0;
-  static size_t   idx = 0;
-  if (!pollables.empty() && millis() - lastPoll > POLL_STEP_MS) {
-    lastPoll = millis();
-    if (idx >= pollables.size()) idx = 0;
-    pollables[idx]->pollState();
-    idx++;
-  }
-
-  // Background re-discovery: catches any device missed at boot or added to the
-  // network later. Uses a LIGHTER scan (shorter, single pass) than boot so it
-  // doesn't stall HAP for long; misses are still caught because it repeats.
-  // Cadence: quick for the first ~2 min (catch boot misses fast), then every
-  // REDISCOVER_MS. New devices are published live via updateDatabase().
-  static uint32_t lastScan = 0;
-  static int      quickScans = 4;            // first 4 rescans are 30s apart
-  uint32_t interval = (quickScans > 0) ? 30000UL : REDISCOVER_MS;
-  if (wifiUp && millis() - lastScan > interval) {
-    lastScan = millis();
-    if (quickScans > 0) quickScans--;
-    int added = discoverAndAdd(2.0f, 1);     // ~2s, single pass
-    if (added > 0) {
-      Serial.printf("[WiZ] re-discovery added %d new device(s); updating HomeKit.\n", added);
-      homeSpan.updateDatabase();
-    }
   }
 }
