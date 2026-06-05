@@ -72,6 +72,9 @@
 #define REDISCOVER_MS     300000UL       // re-scan network for new devices (5 min)
 #define DISCOVER_TIMEOUT  6.0f           // total seconds to listen for discovery replies
 #define DISCOVER_PASSES   3              // sweep the subnet this many times
+#define WIFI_WATCHDOG_MS  120000UL       // reboot if WiFi stays down this long (2 min)
+#define UNRESPONSIVE_AFTER 3             // consecutive poll misses before "unresponsive"
+#define MAX_BACKOFF_MS    60000UL        // cap the poll backoff for a dead device (60s)
 // =============================================================================
 
 // ---- Thread-safe handoff: WiZ task (core 0)  <->  HomeSpan (loop, core 1) -----
@@ -90,9 +93,12 @@ struct DiscResult {             // one discovered device, produced by the task
   String    mac, type, module;
   IPAddress ip;
 };
-struct DeviceAddr {             // mac -> ip the task uses as poll targets
+struct DeviceAddr {             // a poll target + its health/backoff state
   String    mac;
   IPAddress ip;
+  uint8_t   fails = 0;          // consecutive poll failures
+  uint32_t  nextPollMs = 0;     // earliest millis() to poll again (backoff)
+  bool      online = true;      // current reachability
 };
 
 volatile bool            wifiUp = false;  // set true once WiFi is connected
@@ -588,15 +594,32 @@ static void taskDiscoverRound(float timeoutSec, int passes) {
 }
 
 // [TASK] Poll one device's current state and hand it to the main thread.
-static void pollOne(const DeviceAddr &d) {
+// Returns true if the device replied (reachable). On a miss, nothing is pushed,
+// so HomeKit keeps the device's last-known state instead of showing garbage.
+//
+// Identity is verified by MAC, not IP: getPilot echoes the device's "mac", so we
+// only accept the reply if it matches the MAC we targeted. This guards against
+// DHCP reassigning this IP to a DIFFERENT WiZ device (which would otherwise let
+// one bulb's state be attributed to another). A mismatch is treated as a miss,
+// so the device backs off and re-discovery refreshes its IP by MAC.
+static bool pollOne(const DeviceAddr &d) {
   JsonDocument doc;
   PollResult pr; pr.mac = d.mac;
-  if (wizQuery(d.ip, "getPilot", doc, 0.6f)) parsePilot(doc["result"], pr);
+  if (wizQuery(d.ip, "getPilot", doc, 0.6f)) {
+    JsonVariant res = doc["result"];
+    String replyMac = res["mac"] | "";
+    if (replyMac.length() == 0 || replyMac == d.mac)   // same device (or old fw w/o mac)
+      parsePilot(res, pr);
+    else
+      Serial.printf("[WiZ] %s: reply from wrong MAC %s (IP reused) - ignoring\n",
+                    d.mac.c_str(), replyMac.c_str());
+  }
   if (pr.reachable) {
     xSemaphoreTake(wizMux, portMAX_DELAY);
     pollQ.push_back(pr);
     xSemaphoreGive(wizMux);
   }
+  return pr.reachable;
 }
 
 // [TASK] Entry point - pinned to core 0. ALL blocking UDP lives here so the main
@@ -619,17 +642,50 @@ static void wizTaskFn(void *) {
       taskDiscoverRound(2.0f, 1);                          // light background scan
     }
 
+    // Pick the next device that is DUE (respects each device's backoff timer).
     DeviceAddr d; bool have = false;
+    uint32_t now = millis();
     xSemaphoreTake(wizMux, portMAX_DELAY);
-    if (!deviceAddrs.empty()) {
+    for (size_t k = 0; k < deviceAddrs.size(); k++) {
       if (idx >= deviceAddrs.size()) idx = 0;
-      d = deviceAddrs[idx++];
-      have = true;
+      if ((int32_t)(now - deviceAddrs[idx].nextPollMs) >= 0) {
+        d = deviceAddrs[idx]; have = true; idx++; break;
+      }
+      idx++;
     }
     xSemaphoreGive(wizMux);
-    if (have) pollOne(d);
 
-    vTaskDelay(pdMS_TO_TICKS(POLL_STEP_MS));
+    if (have) {
+      bool ok = pollOne(d);                       // blocking UDP, outside the lock
+      now = millis();
+      xSemaphoreTake(wizMux, portMAX_DELAY);
+      for (auto &e : deviceAddrs) {
+        if (e.mac != d.mac) continue;
+        if (ok) {                                 // reachable -> healthy, normal cadence
+          if (!e.online) {
+            e.online = true;
+            Serial.printf("[WiZ] %s back ONLINE\n", e.mac.c_str());
+          }
+          e.fails = 0;
+          e.nextPollMs = now + POLL_STEP_MS;
+        } else {                                  // miss -> exponential backoff
+          if (e.fails < 255) e.fails++;
+          uint32_t backoff = POLL_STEP_MS * (1UL << (e.fails < 5 ? e.fails : 5));
+          if (backoff > MAX_BACKOFF_MS) backoff = MAX_BACKOFF_MS;
+          e.nextPollMs = now + backoff;
+          if (e.online && e.fails >= UNRESPONSIVE_AFTER) {
+            e.online = false;
+            Serial.printf("[WiZ] %s UNRESPONSIVE after %u misses - backing off to %lus\n",
+                          e.mac.c_str(), e.fails, (unsigned long)(backoff / 1000));
+          }
+        }
+        break;
+      }
+      xSemaphoreGive(wizMux);
+      vTaskDelay(pdMS_TO_TICKS(60));              // brief gap between polls
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(200));            // nothing due right now
+    }
   }
 }
 
@@ -657,9 +713,13 @@ static void drainWizResults() {
     bool known = false;
     for (auto &m : knownMacs) if (m == d.mac) { known = true; break; }
     if (known) {
+      // Re-discovery saw this device reply, so it's reachable: refresh its IP
+      // (it may have changed via DHCP) and reset its poll schedule so it's
+      // probed right away at the new address instead of waiting out the backoff.
       if (WiZPollable *s = pollableForMac(d.mac)) s->setIp(d.ip);
       xSemaphoreTake(wizMux, portMAX_DELAY);
-      for (auto &da : deviceAddrs) if (da.mac == d.mac) { da.ip = d.ip; break; }
+      for (auto &da : deviceAddrs)
+        if (da.mac == d.mac) { da.ip = d.ip; da.fails = 0; da.nextPollMs = 0; break; }
       xSemaphoreGive(wizMux);
     } else if (createAccessory(d.ip, d.mac, d.module, d.type)) {
       need = true;
@@ -733,5 +793,23 @@ void loop() {
   if (millis() - lastBeat > 15000) {
     lastBeat = millis();
     Serial.printf("[WiZ] bridged devices: %d\n", (int)knownMacs.size());
+  }
+
+  // WiFi watchdog: once we've connected at least once, reboot if WiFi stays down
+  // for WIFI_WATCHDOG_MS. Recovers from a stuck WiFi stack. Does NOT run during
+  // first-time provisioning (wifiUp is still false then), so the setup AP is safe.
+  static bool     wifiTiming = false;
+  static uint32_t wifiDownStart = 0;
+  if (wifiUp) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiTiming = false;
+    } else if (!wifiTiming) {
+      wifiTiming = true;
+      wifiDownStart = millis();
+    } else if (millis() - wifiDownStart > WIFI_WATCHDOG_MS) {
+      Serial.println("[WiZ] WiFi down > 2 min - restarting.");
+      delay(50);
+      ESP.restart();
+    }
   }
 }
