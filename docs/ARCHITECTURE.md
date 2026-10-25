@@ -58,6 +58,9 @@ core 1  ── loop() ─────►  homeSpan.poll() + drainWizResults()   
 - `discQ` — `DiscResult`s from discovery → main loop creates new accessories /
   refreshes IPs, then calls `updateDatabase()` once per batch.
 - `deviceAddrs` — the `mac→ip` poll-target list the loop fills and the task reads.
+- `identifyQ` — MACs whose **Identify** was tapped in Home; the task blinks the
+  bulb off/on 3× (~3 s, so it can't run on the main loop) and restores its state.
+  Plugs are skipped so Identify never cuts power to what's plugged in.
 
 `onWiFiConnected` just sets `wifiUp`; the task waits on that flag, then does the
 initial scan and settles into: quick re-scans (every 30 s for ~2 min) then every
