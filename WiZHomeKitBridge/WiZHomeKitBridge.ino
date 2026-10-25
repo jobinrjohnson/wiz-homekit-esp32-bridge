@@ -109,10 +109,11 @@ struct DeviceAddr {             // a poll target + its health/backoff state
 };
 
 volatile bool            wifiUp = false;  // set true once WiFi is connected
-SemaphoreHandle_t        wizMux;          // guards the three vectors below
+SemaphoreHandle_t        wizMux;          // guards the four vectors below
 std::vector<PollResult>  pollQ;           // task -> loop
 std::vector<DiscResult>  discQ;           // task -> loop
 std::vector<DeviceAddr>  deviceAddrs;     // loop -> task (poll targets)
+std::vector<String>      identifyQ;       // loop -> task (MACs to blink)
 
 // ---- Pollable interface (so we can store lights & outlets together) ---------
 struct WiZPollable {
@@ -385,6 +386,30 @@ struct ReedSensor : Service::ContactSensor {
 };
 
 // =============================================================================
+// AccessoryInformation whose Identify blinks the WiZ bulb
+// =============================================================================
+// HomeSpan calls update() on this service when the Home app sends Identify.
+// The blink itself takes seconds, so it's queued for the WiZ task instead of
+// blocking homeSpan.poll(). Plugs don't blink: toggling one would cut power to
+// whatever is plugged in.
+struct WiZInfo : Service::AccessoryInformation {
+  String mac;
+  bool   canBlink;
+
+  WiZInfo(const String &mac, bool canBlink)
+      : Service::AccessoryInformation(), mac(mac), canBlink(canBlink) {}
+
+  boolean update() override {
+    if (canBlink) {
+      xSemaphoreTake(wizMux, portMAX_DELAY);
+      identifyQ.push_back(mac);
+      xSemaphoreGive(wizMux);
+    }
+    return true;
+  }
+};
+
+// =============================================================================
 // Discovery + accessory creation
 // =============================================================================
 
@@ -454,7 +479,7 @@ static bool createAccessory(IPAddress ip, const String &mac, const String &modul
   String name = friendlyName(type, mac);
 
   new SpanAccessory(aidFromMac(mac));      // FIXED AID derived from MAC
-    new Service::AccessoryInformation();
+    new WiZInfo(mac, type != "SOCKET");
       new Characteristic::Identify();
       new Characteristic::Name(name.c_str());
       new Characteristic::Manufacturer("WiZ");
@@ -680,6 +705,40 @@ static bool pollOne(const DeviceAddr &d, int8_t &meter) {
   return pr.reachable;
 }
 
+// [TASK] Identify: flash the bulb off/on 3 times, then put back exactly what it
+// was showing (power, brightness, and temp / colour / scene).
+static void taskIdentify(IPAddress ip) {
+  JsonDocument doc;
+  if (!wizQuery(ip, "getPilot", doc, 0.6f) || doc["result"].isNull()) return;
+  JsonVariant r = doc["result"];
+
+  String restore = "\"state\":false";
+  if (r["state"] | false) {
+    restore = "\"state\":true";
+    if (!r["dimming"].isNull()) restore += ",\"dimming\":" + String((int)r["dimming"]);
+    int scene = r["sceneId"] | 0;
+    if (scene > 0) {
+      restore += ",\"sceneId\":" + String(scene);
+      if (!r["speed"].isNull()) restore += ",\"speed\":" + String((int)r["speed"]);
+    } else if (!r["temp"].isNull()) {
+      restore += ",\"temp\":" + String((int)r["temp"]);
+    } else if (!r["r"].isNull()) {
+      restore += ",\"r\":" + String((int)r["r"]) + ",\"g\":" + String((int)r["g"]) +
+                 ",\"b\":" + String((int)r["b"]);
+      if (!r["c"].isNull()) restore += ",\"c\":" + String((int)r["c"]);
+      if (!r["w"].isNull()) restore += ",\"w\":" + String((int)r["w"]);
+    }
+  }
+
+  for (int i = 0; i < 3; i++) {
+    wizSetPilot(ip, "\"state\":false");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    wizSetPilot(ip, "\"state\":true,\"dimming\":100");
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  wizSetPilot(ip, restore);
+}
+
 // [TASK] Entry point - pinned to core 0. ALL blocking UDP lives here so the main
 // loop's homeSpan.poll() (core 1) is never starved.
 static void wizTaskFn(void *) {
@@ -699,6 +758,16 @@ static void wizTaskFn(void *) {
       if (quick > 0) quick--;
       taskDiscoverRound(2.0f, 1);                          // light background scan
     }
+
+    // Identify requests from the Home app (MAC -> current IP, blink outside the lock).
+    std::vector<IPAddress> blink;
+    xSemaphoreTake(wizMux, portMAX_DELAY);
+    for (auto &m : identifyQ)
+      for (auto &e : deviceAddrs)
+        if (e.mac == m) { blink.push_back(e.ip); break; }
+    identifyQ.clear();
+    xSemaphoreGive(wizMux);
+    for (auto &ip : blink) taskIdentify(ip);
 
     // Pick the next device that is DUE (respects each device's backoff timer).
     DeviceAddr d; bool have = false;
