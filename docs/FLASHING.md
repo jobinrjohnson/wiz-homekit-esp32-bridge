@@ -59,7 +59,7 @@ Device @ 192.168.0.8
 
 ## 7. Pair with Apple Home
 Home app → **Add Accessory** → **More options…** → **WiZ HomeKit Bridge** →
-code **466-37-726**.
+code **466-37-726** (or the code you set on the WiFi setup page).
 
 ## HomeSpan serial commands
 With the Serial Monitor open (line-ending = **Newline**), type a letter + Enter:
@@ -71,7 +71,7 @@ With the Serial Monitor open (line-ending = **Newline**), type a letter + Enter:
 | `W` | Re-run WiFi setup |
 | `X` | **Delete stored WiFi credentials** (then it re-provisions) |
 | `H` | **Delete HomeKit pairing** (then re-add the bridge in Home) |
-| `F` | Factory reset (WiFi + pairing) |
+| `F` | Factory reset (WiFi + pairing + saved WiZ device list) |
 | `E` | Erase ALL stored data |
 | `R` | Restart |
 
@@ -98,9 +98,9 @@ button, and the onboard blue LED (GPIO 2) shows what the bridge is doing.
    5 Erase WiFi.
 3. Hold ~3 s to run the selected option. The menu closes by itself after 2 min.
 
-> ⚠️ Holding BOOT for **10 s or more** is a **factory reset** (WiFi and HomeKit
-> pairing erased): you'd re-add the bridge in Home and redo its rooms and
-> automations.
+> ⚠️ Holding BOOT for **10 s or more** is a **factory reset** (WiFi, HomeKit
+> pairing and the saved WiZ device list erased): you'd re-add the bridge in Home
+> and redo its rooms and automations.
 
 The boot banner's `Sketch Version` line shows when the running firmware was
 compiled, so you can confirm an upload actually landed.

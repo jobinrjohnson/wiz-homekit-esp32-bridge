@@ -105,8 +105,10 @@ updates `ContactSensorState` (0 = closed/contact, 1 = open).
 ## Stable identity
 
 Each WiZ accessory's **AID is derived from its MAC** (`aidFromMac` = `100 + low 3
-bytes`), so the same device always has the same HomeKit ID across reboots — Home
-keeps its names/rooms/automations. See [STABLE-IDS.md](STABLE-IDS.md).
+bytes`), so the same device always has the same HomeKit ID across reboots. Every
+bridged device is also saved to NVS (`saveDevices`) and recreated in `setup()`
+(`restoreDevices`) before HomeKit can connect — otherwise Home would delete the
+WiZ accessories during the ~10 s boot scan. See [STABLE-IDS.md](STABLE-IDS.md).
 
 ## Key symbols
 

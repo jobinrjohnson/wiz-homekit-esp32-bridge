@@ -26,15 +26,18 @@
  *      (To re-provision later, type 'X' in the serial monitor to erase WiFi,
  *      or use the BOOT button menu - see CONTROL_PIN below.)
  *   3. In the Apple Home app: Add Accessory -> "More options..." -> select
- *      "WiZ HomeKit Bridge". Pairing code (default HomeSpan code): 466-37-726.
+ *      "WiZ HomeKit Bridge". Pairing code: 466-37-726 (PAIRING_CODE), or the
+ *      code you entered on the WiFi setup page.
  *      All discovered WiZ devices appear as one bridge.
  *
  * NOTES:
  *   - Make sure the ESP32 and the WiZ devices are on the SAME subnet/VLAN and
  *     that the WiZ devices already work in the official WiZ app.
  *   - Devices are discovered at boot and re-scanned periodically; newly added
- *     WiZ devices appear automatically (HomeSpan updateDatabase). Removed
- *     devices simply stop responding (state is left as-is until reboot).
+ *     WiZ devices appear automatically (HomeSpan updateDatabase). Every bridged
+ *     device is saved to NVS and recreated at boot, so Home keeps its name,
+ *     room and automations across restarts. A device that's gone for good
+ *     stays in Home until you type "@f<mac>" in the serial monitor.
  * ------------------------------------------------------------------------------
  */
 
@@ -46,6 +49,7 @@
 #include <math.h>
 #include <lwip/sockets.h>   // BSD sockets - direct port of discover_wiz.py
 #include <fcntl.h>          // non-blocking socket for draining replies mid-sweep
+#include <Preferences.h>    // NVS: remember bridged devices across reboots
 
 // ====================== USER CONFIG ==========================================
 // WiFi is provisioned from your phone - there are NO hardcoded credentials.
@@ -56,7 +60,7 @@
 #define SETUP_AP_PASSWORD "wizsetup"         // password for that setup network
 
 #define BRIDGE_NAME "WiZ HomeKit Bridge"
-#define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726
+#define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726 (see applyPairingCode)
 
 // --- Magnetic reed switch (door/window contact sensor) ----------------------
 // Wire the reed switch between REED_PIN and GND. The internal pull-up is used,
@@ -71,7 +75,8 @@
 // Hold the button ~3s and release for HomeSpan's command menu: the LED blinks N
 // times for option N, a short press moves to the next option, and holding ~3s
 // runs it (1 exit, 2 reboot, 3 WiFi setup AP, 4 unpair HomeKit, 5 erase WiFi).
-// Holding the button 10s+ is a FACTORY RESET (WiFi + HomeKit pairing erased).
+// Holding the button 10s+ is a FACTORY RESET (WiFi, HomeKit pairing and the
+// saved WiZ device list erased).
 // The LED stays solid on while the bridge is connected to HomeKit.
 #define CONTROL_PIN       0              // BOOT button on ESP32 dev boards
 #define STATUS_LED_PIN    2              // onboard blue LED on most ESP32 dev boards
@@ -141,7 +146,8 @@ struct WiZPollable {
   bool settling() { return lastWriteMs && millis() - lastWriteMs < WRITE_SETTLE_MS; }
 };
 std::vector<WiZPollable *> pollables;     // main thread only
-std::vector<String>        knownMacs;     // dedupe (main thread only)
+std::vector<DiscResult>    knownDevs;     // every bridged device (main thread only),
+                                          // saved to NVS and recreated at boot
 
 // ---- HSV <-> RGB helpers ----------------------------------------------------
 static void hsv2rgb(double H, double S, double V, int &R, int &G, int &B) {
@@ -482,36 +488,126 @@ static String hapVersion(const String &fw) {
 }
 
 // Create the HomeKit accessory for a device (deduped by MAC). Returns true if new.
-static bool createAccessory(IPAddress ip, const String &mac, const String &moduleName,
-                            const String &type, const String &fw) {
-  for (auto &m : knownMacs)
-    if (m == mac) return false;            // already added
+static bool createAccessory(const DiscResult &d) {
+  for (auto &k : knownDevs)
+    if (k.mac == d.mac) return false;      // already added
 
-  String name = friendlyName(type, mac);
+  String name = friendlyName(d.type, d.mac);
 
-  new SpanAccessory(aidFromMac(mac));      // FIXED AID derived from MAC
-    new WiZInfo(mac, type != "SOCKET");
+  new SpanAccessory(aidFromMac(d.mac));    // FIXED AID derived from MAC
+    new WiZInfo(d.mac, d.type != "SOCKET");
       new Characteristic::Identify();
       new Characteristic::Name(name.c_str());
       new Characteristic::Manufacturer("WiZ");
-      new Characteristic::SerialNumber(mac.c_str());
-      new Characteristic::Model(moduleName.c_str());
-      new Characteristic::FirmwareRevision(hapVersion(fw).c_str());
+      new Characteristic::SerialNumber(d.mac.c_str());
+      new Characteristic::Model(d.module.c_str());
+      new Characteristic::FirmwareRevision(hapVersion(d.fw).c_str());
 
-  if (type == "SOCKET") {
-    pollables.push_back(new WiZOutlet(ip, mac));
+  if (d.type == "SOCKET") {
+    pollables.push_back(new WiZOutlet(d.ip, d.mac));
   } else {
-    bool color = (type == "RGB");
-    bool cct   = (type == "RGB" || type == "TW");
-    pollables.push_back(new WiZLight(ip, mac, color, cct));
+    bool color = (d.type == "RGB");
+    bool cct   = (d.type == "RGB" || d.type == "TW");
+    pollables.push_back(new WiZLight(d.ip, d.mac, color, cct));
   }
-  knownMacs.push_back(mac);
+  knownDevs.push_back(d);
 
   xSemaphoreTake(wizMux, portMAX_DELAY);   // register as a poll target for the task
-  DeviceAddr da; da.mac = mac; da.ip = ip; da.isPlug = (type == "SOCKET");
+  DeviceAddr da; da.mac = d.mac; da.ip = d.ip; da.isPlug = (d.type == "SOCKET");
   deviceAddrs.push_back(da);
   xSemaphoreGive(wizMux);
   return true;
+}
+
+// ---- Saved device list (NVS) -------------------------------------------------
+// HomeKit deletes any bridged accessory that's missing when it connects - along
+// with its name, room and automations - and HomeSpan answers HomeKit within
+// seconds of boot, long before the background scan finds the WiZ devices. So
+// every device ever bridged is saved here and recreated in setup().
+static void saveDevices() {
+  JsonDocument doc;
+  for (auto &k : knownDevs) {
+    JsonObject o = doc.add<JsonObject>();
+    o["mac"] = k.mac;  o["type"] = k.type;  o["module"] = k.module;
+    o["fw"]  = k.fw;   o["ip"]   = k.ip.toString();
+  }
+  String json;
+  serializeJson(doc, json);
+  Preferences prefs;
+  prefs.begin("wizbridge", false);
+  prefs.putBytes("devices", json.c_str(), json.length());   // blob: no 4 KB string cap
+  prefs.end();
+}
+
+// [MAIN, setup] HomeSpan's factory reset (BOOT held 10s, or serial 'F') erases
+// its own NVS - HomeKit identity + pairings ("HAP") and WiFi ("WIFI") - but not
+// our list. At the next boot, before HomeSpan's first poll() creates a new
+// identity, both are still missing: wipe the list too, so the bridge starts
+// completely fresh. An ordinary restart, erasing only WiFi, or only unpairing
+// leaves at least one of them, so this never fires by mistake.
+// (Reads HomeSpan 2.x's NVS layout.)
+static void forgetDevicesAfterFactoryReset() {
+  Preferences hs;
+  bool idGone = true, wifiGone = true;
+  if (hs.begin("HAP", true))  { idGone   = !hs.isKey("ACCESSORY"); hs.end(); }
+  if (hs.begin("WIFI", true)) { wifiGone = !hs.isKey("WIFIDATA");  hs.end(); }
+  if (!idGone || !wifiGone) return;
+
+  Preferences prefs;
+  prefs.begin("wizbridge", false);
+  if (prefs.isKey("devices")) {
+    prefs.remove("devices");
+    Serial.println("[WiZ] HomeSpan was factory reset - cleared the saved device list");
+  }
+  prefs.end();
+}
+
+// [MAIN, setup] Recreate every saved device's accessory. Returns how many.
+static int restoreDevices() {
+  Preferences prefs;
+  prefs.begin("wizbridge", false);
+  size_t len = prefs.isKey("devices") ? prefs.getBytesLength("devices") : 0;
+  std::vector<char> buf(len + 1, 0);
+  if (len) prefs.getBytes("devices", buf.data(), len);
+  prefs.end();
+
+  JsonDocument doc;
+  if (!len || deserializeJson(doc, buf.data()) != DeserializationError::Ok) return 0;
+  int n = 0;
+  for (JsonObject o : doc.as<JsonArray>()) {
+    DiscResult d;
+    d.mac = o["mac"] | "";  d.type = o["type"] | "";  d.module = o["module"] | "";
+    d.fw  = o["fw"]  | "";
+    d.ip.fromString(o["ip"] | "0.0.0.0");
+    if (d.mac.length() && d.type.length() && createAccessory(d)) n++;
+  }
+  return n;
+}
+
+// [MAIN] Serial command "@f<mac>": forget a WiZ device that's gone for good.
+// Removes its accessory from Home and from the saved list. (If the device is
+// still on the network, the next scan simply adds it back as a new accessory.)
+static void forgetDevice(const char *buf) {
+  String mac = buf + 1;                    // buf = "f<mac>"
+  mac.trim(); mac.toLowerCase(); mac.replace(":", "");
+  auto k = std::find_if(knownDevs.begin(), knownDevs.end(),
+                        [&](const DiscResult &e) { return e.mac == mac; });
+  if (k == knownDevs.end()) {
+    Serial.printf("[WiZ] no saved device with MAC %s\n", mac.c_str());
+    return;
+  }
+  // Drop every reference to the device's services before HomeSpan deletes them.
+  pollables.erase(std::remove_if(pollables.begin(), pollables.end(),
+                  [&](WiZPollable *p) { return p->macAddr() == mac; }), pollables.end());
+  xSemaphoreTake(wizMux, portMAX_DELAY);
+  deviceAddrs.erase(std::remove_if(deviceAddrs.begin(), deviceAddrs.end(),
+                    [&](const DeviceAddr &e) { return e.mac == mac; }), deviceAddrs.end());
+  xSemaphoreGive(wizMux);
+  knownDevs.erase(k);
+  saveDevices();
+  homeSpan.deleteAccessory(aidFromMac(mac));
+  homeSpan.updateDatabase();
+  Serial.printf("[WiZ] forgot %s - removed from Home\n", mac.c_str());
 }
 
 // discover() - port of discover_wiz.py: one ephemeral broadcast-capable socket;
@@ -761,6 +857,12 @@ static void wizTaskFn(void *) {
   while (!wifiUp) vTaskDelay(pdMS_TO_TICKS(200));
   vTaskDelay(pdMS_TO_TICKS(500));
 
+  // Devices restored from NVS already have accessories: fetch their real state
+  // now instead of after the ~10s boot scan, so Home doesn't show them all off.
+  std::vector<DeviceAddr> saved;
+  xSemaphoreTake(wizMux, portMAX_DELAY); saved = deviceAddrs; xSemaphoreGive(wizMux);
+  for (auto &d : saved) { int8_t meter; bool powerReply; pollOne(d, meter, powerReply); }
+
   taskDiscoverRound(DISCOVER_TIMEOUT, DISCOVER_PASSES);   // initial scan
 
   uint32_t lastScan = millis();
@@ -866,11 +968,11 @@ static void drainWizResults() {
   // discovery results -> refresh IP (known) or create accessory (new)
   std::vector<DiscResult> dr;
   xSemaphoreTake(wizMux, portMAX_DELAY); dr.swap(discQ); xSemaphoreGive(wizMux);
-  bool need = false;
+  bool need = false, dirty = false;
   for (auto &d : dr) {
-    bool known = false;
-    for (auto &m : knownMacs) if (m == d.mac) { known = true; break; }
-    if (known) {
+    DiscResult *k = nullptr;
+    for (auto &e : knownDevs) if (e.mac == d.mac) { k = &e; break; }
+    if (k) {
       // Re-discovery saw this device reply, so it's reachable: refresh its IP
       // (it may have changed via DHCP) and reset its poll schedule so it's
       // probed right away at the new address instead of waiting out the backoff.
@@ -879,11 +981,17 @@ static void drainWizResults() {
       for (auto &da : deviceAddrs)
         if (da.mac == d.mac) { da.ip = d.ip; da.fails = 0; da.nextPollMs = 0; break; }
       xSemaphoreGive(wizMux);
-    } else if (createAccessory(d.ip, d.mac, d.module, d.type, d.fw)) {
-      need = true;
+      // Keep the saved copy current (new DHCP address, firmware after an update).
+      if ((uint32_t)k->ip != (uint32_t)d.ip || k->fw != d.fw || k->module != d.module) {
+        *k = d;
+        dirty = true;
+      }
+    } else if (createAccessory(d)) {
+      need = dirty = true;
       Serial.printf("[WiZ] added %s (%s)\n", d.mac.c_str(), d.type.c_str());
     }
   }
+  if (dirty) saveDevices();
   if (need) homeSpan.updateDatabase();
 }
 
@@ -897,6 +1005,26 @@ void onWiFiConnected() {
                 WiFi.subnetMask().toString().c_str());
 }
 
+// [setup] HomeKit setup code. PAIRING_CODE is applied only when it's new - on
+// the first boot, or after you edit it above - not on every boot, so a code set
+// on the WiFi setup page (or with the serial 'S' command) survives reboots.
+// HomeSpan keeps the active code in NVS ("SRP"); we remember which PAIRING_CODE
+// we last applied. Must run before the first homeSpan.poll().
+static void applyPairingCode() {
+  Preferences hs, prefs;
+  bool haveCode = hs.begin("SRP", true) && hs.isKey("VERIFYDATA");
+  hs.end();
+  prefs.begin("wizbridge", false);
+  bool applied = prefs.isKey("pairCode") && prefs.getString("pairCode") == PAIRING_CODE;
+  if (!haveCode || !applied) {
+    homeSpan.setPairingCode(PAIRING_CODE);
+    prefs.putString("pairCode", PAIRING_CODE);
+    Serial.printf("[WiZ] HomeKit setup code set from PAIRING_CODE: %.3s-%.2s-%.3s\n",
+                  PAIRING_CODE, PAIRING_CODE + 3, PAIRING_CODE + 5);
+  }
+  prefs.end();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -908,7 +1036,7 @@ void setup() {
   homeSpan.setApSSID(SETUP_AP_SSID);
   homeSpan.setApPassword(SETUP_AP_PASSWORD);
   homeSpan.enableAutoStartAP();            // start setup AP when no WiFi saved
-  homeSpan.setPairingCode(PAIRING_CODE);
+  applyPairingCode();                      // keeps a code set on the setup page
   homeSpan.setLogLevel(0);   // silence HomeSpan HAP chatter so our logs are readable
   homeSpan.setWifiCallback(onWiFiConnected);
   homeSpan.setControlPin(CONTROL_PIN);
@@ -936,10 +1064,18 @@ void setup() {
       new Characteristic::FirmwareRevision("1.0");
     new ReedSensor(REED_PIN, REED_ACTIVE_LOW);
 
+  wizMux = xSemaphoreCreateMutex();
+
+  // Recreate every previously bridged WiZ device NOW, so it's present when
+  // HomeKit first connects after a reboot (Home deletes missing accessories).
+  forgetDevicesAfterFactoryReset();
+  Serial.printf("[WiZ] restored %d saved device(s)\n", restoreDevices());
+  new SpanUserCommand('f', "<mac> - forget a WiZ device that's gone for good (removes it from Home)",
+                      forgetDevice);
+
   // Start the WiZ I/O task on core 0. ALL blocking UDP (discovery + polling) runs
   // there, so homeSpan.poll() on the main loop (core 1) is never blocked - this is
   // what prevents the "No Response" stalls.
-  wizMux = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(wizTaskFn, "wizTask", 10240, NULL, 1, NULL, 0);
 }
 
@@ -953,7 +1089,7 @@ void loop() {
   static uint32_t lastBeat = 0;
   if (millis() - lastBeat > 15000) {
     lastBeat = millis();
-    Serial.printf("[WiZ] bridged devices: %d\n", (int)knownMacs.size());
+    Serial.printf("[WiZ] bridged devices: %d\n", (int)knownDevs.size());
   }
 
   // WiFi watchdog: once we've connected at least once, reboot if WiFi stays down

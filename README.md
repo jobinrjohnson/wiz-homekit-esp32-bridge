@@ -14,7 +14,8 @@ switch** (door/window contact sensor) wired to a GPIO.
 - **Phone-based WiFi setup** — no hardcoded credentials; provision from your
   iPhone via a setup Wi-Fi network.
 - **Reboot-stable** — each device gets a permanent HomeKit ID derived from its
-  MAC, so names/rooms/automations survive restarts.
+  MAC, and the device list is saved and recreated at boot, so names/rooms/
+  automations survive restarts.
 - **Self-healing** — re-scans periodically; devices missed at boot or added later
   appear automatically.
 - **Local hardware** — a reed switch on a GPIO shows up as a HomeKit Contact
@@ -39,7 +40,8 @@ switch** (door/window contact sensor) wired to a GPIO.
    enter your home WiFi in the captive-portal page → see
    [docs/WIFI-PROVISIONING.md](docs/WIFI-PROVISIONING.md).
 4. **Pair** in the Home app: Add Accessory → "More options…" → "WiZ HomeKit
-   Bridge", code **466-37-726**. All WiZ devices appear under one bridge.
+   Bridge", code **466-37-726** (or the code you set on the WiFi setup page).
+   All WiZ devices appear under one bridge.
 
 ## Documentation
 

@@ -55,6 +55,23 @@ This is what the **MAC-based stable AIDs** fix — make sure you're on the curre
 firmware. After upgrading from an older (implicit-AID) version, re-add the bridge
 **once**; it's stable thereafter. See [STABLE-IDS.md](STABLE-IDS.md).
 
+## Pairing fails: `*** ERROR: SRP Proof Verification Failed`
+The setup code typed in the Home app doesn't match the bridge's. It's
+**466-37-726** (`PAIRING_CODE`) unless you entered a different code on the WiFi
+setup page — then use that one. Forgot it? Type **`S`** followed by a new
+8-digit code in the serial monitor (e.g. `S 46637726`) and pair with that.
+
+## Rooms/names reset after the bridge restarts
+Home deletes bridged accessories that are missing when it reconnects. Current
+firmware saves the device list to NVS and recreates it at boot (look for
+`[WiZ] restored N saved device(s)` in the log). The first boot after updating
+starts with an empty list, so set up rooms and names once more; after that they
+stick. See [STABLE-IDS.md](STABLE-IDS.md#saved-device-list-nvs).
+
+## A WiZ device you removed is still in Home
+The saved list keeps it. Type `@f<mac>` in the serial monitor to remove it —
+see [STABLE-IDS.md](STABLE-IDS.md#devices-that-are-gone-for-good).
+
 ## A device shows the wrong type (e.g. plug as a bulb)
 Check the `Module`/`Raw config` line in the boot log against the table in
 [WIZ_PROTOCOL.md](WIZ_PROTOCOL.md#module-naming). If `moduleName` was empty, the
@@ -88,6 +105,6 @@ your iPhone is on the home network.
 | `X` | WiFi credentials |
 | `H` | HomeKit pairing |
 | `A` | (re)start setup AP now |
-| `F` | factory reset (WiFi + pairing) |
+| `F` | factory reset (WiFi + pairing + saved WiZ device list) |
 | `E` | erase ALL stored data |
 | `R` | restart |

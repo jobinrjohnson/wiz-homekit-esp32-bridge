@@ -14,7 +14,9 @@ portal — all from the iPhone, no app required.
 3. iOS auto-opens a **captive-portal page**. (If it doesn't, open a browser to
    `http://192.168.4.1`.)
 4. Choose your home WiFi, enter its password, and submit. You can also set the
-   HomeKit pairing code here.
+   HomeKit pairing code here: leave it blank to keep the current one
+   (466-37-726 by default), or enter a new 8-digit code — it then stays across
+   reboots, so use it when adding the bridge in Home.
 5. The ESP32 saves the credentials to NVS, reboots, connects to your home WiFi,
    and starts WiZ discovery. Watch the serial monitor for `WiFi up. IP=…`.
 
@@ -28,7 +30,8 @@ Monitor (115200, line-ending = Newline):
 
 - **`A`** — start the setup AP immediately (even if creds are stored).
 - **`X`** — delete stored WiFi credentials and reboot → AP starts on next boot.
-- **`F`** / **`E`** — factory reset / erase all (also clears HomeKit pairing).
+- **`F`** / **`E`** — factory reset / erase all (also clears HomeKit pairing and
+  the saved WiZ device list).
 
 Without a computer, use the **BOOT button menu** (option 3 starts the setup AP,
 option 5 erases WiFi) — see [FLASHING.md](FLASHING.md#boot-button-menu).
