@@ -28,7 +28,8 @@ Monitor (115200, line-ending = Newline):
 
 - **`A`** — start the setup AP immediately (even if creds are stored).
 - **`X`** — delete stored WiFi credentials and reboot → AP starts on next boot.
-- **`F`** / **`E`** — factory reset / erase all (also clears HomeKit pairing).
+- **`F`** / **`E`** — factory reset / erase all (also clears HomeKit pairing and
+  the saved WiZ device list).
 
 Without a computer, use the **BOOT button menu** (option 3 starts the setup AP,
 option 5 erases WiFi) — see [FLASHING.md](FLASHING.md#boot-button-menu).

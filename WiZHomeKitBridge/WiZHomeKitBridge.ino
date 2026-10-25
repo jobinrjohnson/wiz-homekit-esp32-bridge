@@ -74,7 +74,8 @@
 // Hold the button ~3s and release for HomeSpan's command menu: the LED blinks N
 // times for option N, a short press moves to the next option, and holding ~3s
 // runs it (1 exit, 2 reboot, 3 WiFi setup AP, 4 unpair HomeKit, 5 erase WiFi).
-// Holding the button 10s+ is a FACTORY RESET (WiFi + HomeKit pairing erased).
+// Holding the button 10s+ is a FACTORY RESET (WiFi, HomeKit pairing and the
+// saved WiZ device list erased).
 // The LED stays solid on while the bridge is connected to HomeKit.
 #define CONTROL_PIN       0              // BOOT button on ESP32 dev boards
 #define STATUS_LED_PIN    2              // onboard blue LED on most ESP32 dev boards
@@ -534,6 +535,29 @@ static void saveDevices() {
   Preferences prefs;
   prefs.begin("wizbridge", false);
   prefs.putBytes("devices", json.c_str(), json.length());   // blob: no 4 KB string cap
+  prefs.end();
+}
+
+// [MAIN, setup] HomeSpan's factory reset (BOOT held 10s, or serial 'F') erases
+// its own NVS - HomeKit identity + pairings ("HAP") and WiFi ("WIFI") - but not
+// our list. At the next boot, before HomeSpan's first poll() creates a new
+// identity, both are still missing: wipe the list too, so the bridge starts
+// completely fresh. An ordinary restart, erasing only WiFi, or only unpairing
+// leaves at least one of them, so this never fires by mistake.
+// (Reads HomeSpan 2.x's NVS layout.)
+static void forgetDevicesAfterFactoryReset() {
+  Preferences hs;
+  bool idGone = true, wifiGone = true;
+  if (hs.begin("HAP", true))  { idGone   = !hs.isKey("ACCESSORY"); hs.end(); }
+  if (hs.begin("WIFI", true)) { wifiGone = !hs.isKey("WIFIDATA");  hs.end(); }
+  if (!idGone || !wifiGone) return;
+
+  Preferences prefs;
+  prefs.begin("wizbridge", false);
+  if (prefs.isKey("devices")) {
+    prefs.remove("devices");
+    Serial.println("[WiZ] HomeSpan was factory reset - cleared the saved device list");
+  }
   prefs.end();
 }
 
@@ -1023,6 +1047,7 @@ void setup() {
 
   // Recreate every previously bridged WiZ device NOW, so it's present when
   // HomeKit first connects after a reboot (Home deletes missing accessories).
+  forgetDevicesAfterFactoryReset();
   Serial.printf("[WiZ] restored %d saved device(s)\n", restoreDevices());
   new SpanUserCommand('f', "<mac> - forget a WiZ device that's gone for good (removes it from Home)",
                       forgetDevice);

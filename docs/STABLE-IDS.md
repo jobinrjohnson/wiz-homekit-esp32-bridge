@@ -80,8 +80,11 @@ app's serial number field):
 That deletes its accessory from Home and from the saved list. If the device is
 actually still on the network, the next scan adds it back as a new accessory.
 
-Erasing all NVS (serial `E`) also clears the list; a factory reset (`F`, or
-holding BOOT 10 s) does not, but it unpairs the bridge anyway.
+A factory reset (serial `F`, or holding BOOT 10 s) clears the list too, so the
+bridge starts completely fresh: HomeSpan only erases its own data, so on the
+next boot the sketch sees HomeSpan's identity and WiFi both gone and wipes the
+list (`[WiZ] HomeSpan was factory reset - cleared the saved device list`).
+Erasing all NVS (serial `E`) clears it as well.
 
 ## Collision note
 

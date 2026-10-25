@@ -99,6 +99,6 @@ your iPhone is on the home network.
 | `X` | WiFi credentials |
 | `H` | HomeKit pairing |
 | `A` | (re)start setup AP now |
-| `F` | factory reset (WiFi + pairing) |
+| `F` | factory reset (WiFi + pairing + saved WiZ device list) |
 | `E` | erase ALL stored data |
 | `R` | restart |
