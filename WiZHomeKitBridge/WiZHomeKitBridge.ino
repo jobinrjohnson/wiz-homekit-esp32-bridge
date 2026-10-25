@@ -94,7 +94,7 @@ struct PollResult {              // one getPilot result, produced by the task
                                  // NAN = metered but no reading this poll
 };
 struct DiscResult {             // one discovered device, produced by the task
-  String    mac, type, module;
+  String    mac, type, module, fw;
   IPAddress ip;
 };
 struct DeviceAddr {             // a poll target + its health/backoff state
@@ -431,9 +431,23 @@ static uint32_t aidFromMac(const String &mac) {
   return 100 + low;
 }
 
+// HAP FirmwareRevision must be "x[.y[.z]]" (digits only), so keep the leading
+// numeric part of WiZ's fwVersion (e.g. "1.37.0") and fall back to "1.0".
+static String hapVersion(const String &fw) {
+  String v; int dots = 0;
+  for (size_t i = 0; i < fw.length(); i++) {
+    char c = fw[i];
+    if (c == '.' && v.length() && v[v.length() - 1] != '.' && dots < 2) { v += c; dots++; }
+    else if (isdigit(c)) v += c;
+    else break;
+  }
+  if (v.endsWith(".")) v.remove(v.length() - 1);
+  return v.length() ? v : "1.0";
+}
+
 // Create the HomeKit accessory for a device (deduped by MAC). Returns true if new.
-static bool createAccessory(IPAddress ip, const String &mac,
-                            const String &moduleName, const String &type) {
+static bool createAccessory(IPAddress ip, const String &mac, const String &moduleName,
+                            const String &type, const String &fw) {
   for (auto &m : knownMacs)
     if (m == mac) return false;            // already added
 
@@ -446,7 +460,7 @@ static bool createAccessory(IPAddress ip, const String &mac,
       new Characteristic::Manufacturer("WiZ");
       new Characteristic::SerialNumber(mac.c_str());
       new Characteristic::Model(moduleName.c_str());
-      new Characteristic::FirmwareRevision("1.0");
+      new Characteristic::FirmwareRevision(hapVersion(fw).c_str());
 
   if (type == "SOCKET") {
     pollables.push_back(new WiZOutlet(ip, mac));
@@ -586,13 +600,14 @@ static void taskReport(IPAddress ip, std::vector<DiscResult> &dOut,
   JsonVariant r = cfg["result"];
   String module = r["moduleName"] | "";
   String mac    = r["mac"]        | "";
+  String fw     = r["fwVersion"]  | "";
   if (!mac.length() || !module.length()) return;
   String type = detectType(module);
 
-  Serial.printf("Device @ %s  mac=%s  module=%s  type=%s\n",
-                ip.toString().c_str(), mac.c_str(), module.c_str(), type.c_str());
+  Serial.printf("Device @ %s  mac=%s  module=%s  fw=%s  type=%s\n",
+                ip.toString().c_str(), mac.c_str(), module.c_str(), fw.c_str(), type.c_str());
 
-  dOut.push_back({mac, type, module, ip});
+  dOut.push_back({mac, type, module, fw, ip});
   PollResult pr; pr.mac = mac;
   if (type == "SOCKET") pr.watts = NAN;   // In Use is left to the regular poll
   if (havePilot) parsePilot(pilot["result"], pr);
@@ -771,7 +786,7 @@ static void drainWizResults() {
       for (auto &da : deviceAddrs)
         if (da.mac == d.mac) { da.ip = d.ip; da.fails = 0; da.nextPollMs = 0; break; }
       xSemaphoreGive(wizMux);
-    } else if (createAccessory(d.ip, d.mac, d.module, d.type)) {
+    } else if (createAccessory(d.ip, d.mac, d.module, d.type, d.fw)) {
       need = true;
       Serial.printf("[WiZ] added %s (%s)\n", d.mac.c_str(), d.type.c_str());
     }
