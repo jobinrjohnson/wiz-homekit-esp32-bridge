@@ -75,6 +75,7 @@
 #define WIFI_WATCHDOG_MS  120000UL       // reboot if WiFi stays down this long (2 min)
 #define UNRESPONSIVE_AFTER 3             // consecutive poll misses before "unresponsive"
 #define MAX_BACKOFF_MS    60000UL        // cap the poll backoff for a dead device (60s)
+#define WRITE_SETTLE_MS   3000UL         // ignore poll results this long after a Home write
 // =============================================================================
 
 // ---- Thread-safe handoff: WiZ task (core 0)  <->  HomeSpan (loop, core 1) -----
@@ -109,9 +110,17 @@ std::vector<DeviceAddr>  deviceAddrs;     // loop -> task (poll targets)
 
 // ---- Pollable interface (so we can store lights & outlets together) ---------
 struct WiZPollable {
+  uint32_t lastWriteMs = 0;     // millis() of the last Home write (main thread only)
+
   virtual void   setIp(IPAddress ip) = 0;
   virtual String macAddr() = 0;
   virtual void   applyPilot(const PollResult &p) = 0;   // applied on main thread
+
+  // A poll result taken before (or racing) a Home write carries the OLD state.
+  // Pushing that back via setVal makes the Home app flag the write as failed,
+  // so drop poll results until the bulb has had time to apply the command.
+  void markWritten() { lastWriteMs = millis(); }
+  bool settling() { return lastWriteMs && millis() - lastWriteMs < WRITE_SETTLE_MS; }
 };
 std::vector<WiZPollable *> pollables;     // main thread only
 std::vector<String>        knownMacs;     // dedupe (main thread only)
@@ -241,6 +250,8 @@ struct WiZLight : Service::LightBulb, WiZPollable {
 
   // Called by HomeSpan when the Home app changes something.
   boolean update() override {
+    markWritten();
+
     // Pure OFF -> just send state:false (keeps last color/temp on the bulb).
     if (power->updated() && power->getNewVal() == false) {
       wizSetPilot(ip, "\"state\":false");
@@ -276,7 +287,7 @@ struct WiZLight : Service::LightBulb, WiZPollable {
 
   // Apply a getPilot result fetched by the WiZ task. Runs on the MAIN thread.
   void applyPilot(const PollResult &p) override {
-    if (!p.reachable) return;
+    if (!p.reachable || settling()) return;
     if (power->getVal<bool>() != p.state) power->setVal(p.state);
     if (bright && p.dimming > 0 && bright->getVal() != p.dimming)
       bright->setVal(p.dimming);
@@ -287,8 +298,9 @@ struct WiZLight : Service::LightBulb, WiZPollable {
     if (hue && p.r >= 0) {
       double H, S, V;
       rgb2hsv(p.r, p.g, p.b, H, S, V);
-      hue->setVal(H);
-      sat->setVal(S);
+      // RGB<->HSV round-trips aren't exact; only push real changes.
+      if (fabs(hue->getVal<double>() - H) > 2) hue->setVal(H);
+      if (fabs(sat->getVal<double>() - S) > 2) sat->setVal(S);
     }
   }
 };
@@ -310,12 +322,13 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
   }
 
   boolean update() override {
+    markWritten();
     wizSetPilot(ip, power->getNewVal() ? "\"state\":true" : "\"state\":false");
     return true;
   }
 
   void applyPilot(const PollResult &p) override {
-    if (!p.reachable) return;
+    if (!p.reachable || settling()) return;
     if (power->getVal<bool>() != p.state) power->setVal(p.state);
   }
 };
