@@ -83,8 +83,10 @@ flips back off) works well and is automatable. Common scene IDs: 1 Ocean,
 ## Energy monitoring (plugs)
 
 WiZ energy plugs answer `getPower` (milliwatts), but the **stock Home app has no
-power/energy UI**. It can be surfaced to the **Eve app** and other third-party
-HomeKit apps via Eve custom characteristics. See
+power/energy UI**. The bridge uses it to drive the outlet's native **In Use**
+status: `IN_USE_WATTS` (default `2.0`) is the threshold — raise it if a device's
+standby draw keeps the plug "In Use". Watts/kWh can be surfaced to the **Eve
+app** and other third-party HomeKit apps via Eve custom characteristics. See
 [LIMITATIONS.md](LIMITATIONS.md#energy-monitoring).
 
 ## Color-temperature range
