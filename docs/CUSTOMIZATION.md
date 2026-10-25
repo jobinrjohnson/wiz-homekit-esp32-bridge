@@ -10,7 +10,7 @@ All knobs live in the **USER CONFIG** block at the top of
 | `SETUP_AP_SSID` | `"WiZBridge-Setup"` | name of the WiFi setup network |
 | `SETUP_AP_PASSWORD` | `"wizsetup"` | password for the setup network (`""` = open) |
 | `BRIDGE_NAME` | `"WiZ HomeKit Bridge"` | name shown in the Home app |
-| `PAIRING_CODE` | `"46637726"` | 8-digit HomeKit setup code (shown 466-37-726) |
+| `PAIRING_CODE` | `"46637726"` | 8-digit HomeKit setup code (shown 466-37-726). Applied on the first boot and whenever you change it here; a code set later on the WiFi setup page (or serial `S`) replaces it until then |
 | `REED_PIN` | `23` | GPIO for the reed switch |
 | `REED_NAME` | `"Door Sensor"` | reed sensor name in Home |
 | `REED_ACTIVE_LOW` | `true` | `false` if your reed is normally-closed / inverted |

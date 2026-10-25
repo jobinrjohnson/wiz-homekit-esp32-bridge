@@ -40,7 +40,8 @@ switch** (door/window contact sensor) wired to a GPIO.
    enter your home WiFi in the captive-portal page → see
    [docs/WIFI-PROVISIONING.md](docs/WIFI-PROVISIONING.md).
 4. **Pair** in the Home app: Add Accessory → "More options…" → "WiZ HomeKit
-   Bridge", code **466-37-726**. All WiZ devices appear under one bridge.
+   Bridge", code **466-37-726** (or the code you set on the WiFi setup page).
+   All WiZ devices appear under one bridge.
 
 ## Documentation
 

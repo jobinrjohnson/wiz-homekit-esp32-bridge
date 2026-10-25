@@ -26,7 +26,8 @@
  *      (To re-provision later, type 'X' in the serial monitor to erase WiFi,
  *      or use the BOOT button menu - see CONTROL_PIN below.)
  *   3. In the Apple Home app: Add Accessory -> "More options..." -> select
- *      "WiZ HomeKit Bridge". Pairing code (default HomeSpan code): 466-37-726.
+ *      "WiZ HomeKit Bridge". Pairing code: 466-37-726 (PAIRING_CODE), or the
+ *      code you entered on the WiFi setup page.
  *      All discovered WiZ devices appear as one bridge.
  *
  * NOTES:
@@ -59,7 +60,7 @@
 #define SETUP_AP_PASSWORD "wizsetup"         // password for that setup network
 
 #define BRIDGE_NAME "WiZ HomeKit Bridge"
-#define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726
+#define PAIRING_CODE "46637726"          // 8 digits, shown as 466-37-726 (see applyPairingCode)
 
 // --- Magnetic reed switch (door/window contact sensor) ----------------------
 // Wire the reed switch between REED_PIN and GND. The internal pull-up is used,
@@ -1004,6 +1005,26 @@ void onWiFiConnected() {
                 WiFi.subnetMask().toString().c_str());
 }
 
+// [setup] HomeKit setup code. PAIRING_CODE is applied only when it's new - on
+// the first boot, or after you edit it above - not on every boot, so a code set
+// on the WiFi setup page (or with the serial 'S' command) survives reboots.
+// HomeSpan keeps the active code in NVS ("SRP"); we remember which PAIRING_CODE
+// we last applied. Must run before the first homeSpan.poll().
+static void applyPairingCode() {
+  Preferences hs, prefs;
+  bool haveCode = hs.begin("SRP", true) && hs.isKey("VERIFYDATA");
+  hs.end();
+  prefs.begin("wizbridge", false);
+  bool applied = prefs.isKey("pairCode") && prefs.getString("pairCode") == PAIRING_CODE;
+  if (!haveCode || !applied) {
+    homeSpan.setPairingCode(PAIRING_CODE);
+    prefs.putString("pairCode", PAIRING_CODE);
+    Serial.printf("[WiZ] HomeKit setup code set from PAIRING_CODE: %.3s-%.2s-%.3s\n",
+                  PAIRING_CODE, PAIRING_CODE + 3, PAIRING_CODE + 5);
+  }
+  prefs.end();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -1015,7 +1036,7 @@ void setup() {
   homeSpan.setApSSID(SETUP_AP_SSID);
   homeSpan.setApPassword(SETUP_AP_PASSWORD);
   homeSpan.enableAutoStartAP();            // start setup AP when no WiFi saved
-  homeSpan.setPairingCode(PAIRING_CODE);
+  applyPairingCode();                      // keeps a code set on the setup page
   homeSpan.setLogLevel(0);   // silence HomeSpan HAP chatter so our logs are readable
   homeSpan.setWifiCallback(onWiFiConnected);
   homeSpan.setControlPin(CONTROL_PIN);

@@ -55,6 +55,12 @@ This is what the **MAC-based stable AIDs** fix — make sure you're on the curre
 firmware. After upgrading from an older (implicit-AID) version, re-add the bridge
 **once**; it's stable thereafter. See [STABLE-IDS.md](STABLE-IDS.md).
 
+## Pairing fails: `*** ERROR: SRP Proof Verification Failed`
+The setup code typed in the Home app doesn't match the bridge's. It's
+**466-37-726** (`PAIRING_CODE`) unless you entered a different code on the WiFi
+setup page — then use that one. Forgot it? Type **`S`** followed by a new
+8-digit code in the serial monitor (e.g. `S 46637726`) and pair with that.
+
 ## Rooms/names reset after the bridge restarts
 Home deletes bridged accessories that are missing when it reconnects. Current
 firmware saves the device list to NVS and recreates it at boot (look for

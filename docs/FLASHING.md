@@ -59,7 +59,7 @@ Device @ 192.168.0.8
 
 ## 7. Pair with Apple Home
 Home app → **Add Accessory** → **More options…** → **WiZ HomeKit Bridge** →
-code **466-37-726**.
+code **466-37-726** (or the code you set on the WiFi setup page).
 
 ## HomeSpan serial commands
 With the Serial Monitor open (line-ending = **Newline**), type a letter + Enter:
