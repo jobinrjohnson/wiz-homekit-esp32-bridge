@@ -30,6 +30,9 @@ Monitor (115200, line-ending = Newline):
 - **`X`** — delete stored WiFi credentials and reboot → AP starts on next boot.
 - **`F`** / **`E`** — factory reset / erase all (also clears HomeKit pairing).
 
+Without a computer, use the **BOOT button menu** (option 3 starts the setup AP,
+option 5 erases WiFi) — see [FLASHING.md](FLASHING.md#boot-button-menu).
+
 ## Important gotcha after a re-flash
 
 A normal sketch upload does **not** erase WiFi credentials — they're in the NVS

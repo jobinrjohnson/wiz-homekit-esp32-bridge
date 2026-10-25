@@ -23,7 +23,8 @@
  *   2. WiFi is provisioned from your phone (no hardcoded credentials):
  *      on the iPhone, join the "WiZBridge-Setup" WiFi network (password
  *      "wizsetup"); a captive-portal page opens - enter your home WiFi there.
- *      (To re-provision later, type 'X' in the serial monitor to erase WiFi.)
+ *      (To re-provision later, type 'X' in the serial monitor to erase WiFi,
+ *      or use the BOOT button menu - see CONTROL_PIN below.)
  *   3. In the Apple Home app: Add Accessory -> "More options..." -> select
  *      "WiZ HomeKit Bridge". Pairing code (default HomeSpan code): 466-37-726.
  *      All discovered WiZ devices appear as one bridge.
@@ -65,6 +66,15 @@
 #define REED_PIN          23             // GPIO the reed switch is wired to
 #define REED_NAME         "Door Sensor"  // name shown in the Home app
 #define REED_ACTIVE_LOW   true           // true: magnet present -> pin LOW -> "closed"
+
+// --- Control button + status LED (HomeSpan) ---------------------------------
+// Hold the button ~3s and release for HomeSpan's command menu: the LED blinks N
+// times for option N, a short press moves to the next option, and holding ~3s
+// runs it (1 exit, 2 reboot, 3 WiFi setup AP, 4 unpair HomeKit, 5 erase WiFi).
+// Holding the button 10s+ is a FACTORY RESET (WiFi + HomeKit pairing erased).
+// The LED stays solid on while the bridge is connected to HomeKit.
+#define CONTROL_PIN       0              // BOOT button on ESP32 dev boards
+#define STATUS_LED_PIN    2              // onboard blue LED on most ESP32 dev boards
 
 #define WIZ_PORT          38899          // WiZ UDP control port (devices listen here)
 #define MIN_BRIGHTNESS    10             // WiZ dimming floor (valid range 10-100)
@@ -901,6 +911,9 @@ void setup() {
   homeSpan.setPairingCode(PAIRING_CODE);
   homeSpan.setLogLevel(0);   // silence HomeSpan HAP chatter so our logs are readable
   homeSpan.setWifiCallback(onWiFiConnected);
+  homeSpan.setControlPin(CONTROL_PIN);
+  homeSpan.setStatusPin(STATUS_LED_PIN);
+  homeSpan.setSketchVersion(__DATE__ " " __TIME__);   // build time, shown at boot
   homeSpan.begin(Category::Bridges, BRIDGE_NAME, "wiz-bridge");
 
   // The bridge accessory itself (always the first accessory) - fixed AID 1.

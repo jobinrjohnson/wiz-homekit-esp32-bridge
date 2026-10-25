@@ -14,6 +14,8 @@ All knobs live in the **USER CONFIG** block at the top of
 | `REED_PIN` | `23` | GPIO for the reed switch |
 | `REED_NAME` | `"Door Sensor"` | reed sensor name in Home |
 | `REED_ACTIVE_LOW` | `true` | `false` if your reed is normally-closed / inverted |
+| `CONTROL_PIN` | `0` | HomeSpan control button (the BOOT button) — see [FLASHING.md](FLASHING.md#boot-button-menu) |
+| `STATUS_LED_PIN` | `2` | HomeSpan status LED (onboard blue LED on most dev boards) |
 | `MIN_BRIGHTNESS` | `10` | WiZ dimming floor (WiZ valid range is 10–100) |
 | `POLL_STEP_MS` | `2500` | gap between polling successive devices |
 | `REDISCOVER_MS` | `300000` | background re-scan interval (5 min) |
