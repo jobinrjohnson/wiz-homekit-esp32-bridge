@@ -27,7 +27,7 @@ switch** (door/window contact sensor) wired to a GPIO.
 | Color (RGB) bulb/strip  | contains `RGB`             | Lightbulb    | On, Brightness, Hue, Saturation, ColorTemperature |
 | Tunable-white bulb      | contains `TW`              | Lightbulb    | On, Brightness, ColorTemperature                 |
 | Dimmable-white bulb     | contains `DW` (default)    | Lightbulb    | On, Brightness                                   |
-| Smart plug / socket     | `SOCKET`/`PLUG`/`SWITCH`   | Outlet       | On                                               |
+| Smart plug / socket     | `SOCKET`/`PLUG`/`SWITCH`   | Outlet       | On, In Use                                       |
 | Magnetic reed switch    | local GPIO                 | ContactSensor| Open / Closed                                    |
 
 ## Quick start

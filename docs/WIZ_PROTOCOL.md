@@ -46,8 +46,9 @@ A device is in **either** color mode (`r,g,b`) **or** CCT mode (`temp`).
 ```json
 {"method":"getPower","params":{}}  →  {"result":{"power": 12345}}   // milliwatts
 ```
-Not exposed in the stock Home app (HomeKit has no power characteristic) — see
-[LIMITATIONS.md](LIMITATIONS.md).
+Plugs without a meter reply with an `"error"` object instead. HomeKit has no
+power characteristic, so the bridge only uses this to set the outlet's
+**In Use** status — see [LIMITATIONS.md](LIMITATIONS.md).
 
 ### `registration` — discovery probe
 Broadcasting this makes every WiZ device reply:

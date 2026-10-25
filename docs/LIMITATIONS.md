@@ -9,6 +9,12 @@ WiZ energy plugs answer `getPower` (instantaneous watts, in milliwatts), but
 **HomeKit has no power/energy characteristic**, so the **stock Apple Home app
 cannot display watts or kWh** — it only shows the on/off outlet.
 
+**What the bridge does natively:** the Outlet's standard `OutletInUse`
+characteristic is driven from `getPower` — *In Use* when the plug is on and
+drawing at least `IN_USE_WATTS` (default 2 W). Plugs without a meter (they
+answer `getPower` with an error, or not at all) simply report In Use = On.
+The meter is auto-detected per plug; look for `power meter: yes/no` in the log.
+
 **Workaround — Eve custom characteristics.** Eve defined unofficial UUIDs
 (`E863F1…`) for power/energy that the **Eve app**, Controller for HomeKit, Home+,
 etc. read and graph. HomeSpan can attach them via `CUSTOM_CHAR`:

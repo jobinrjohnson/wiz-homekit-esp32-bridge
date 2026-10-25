@@ -76,6 +76,7 @@
 #define UNRESPONSIVE_AFTER 3             // consecutive poll misses before "unresponsive"
 #define MAX_BACKOFF_MS    60000UL        // cap the poll backoff for a dead device (60s)
 #define WRITE_SETTLE_MS   3000UL         // ignore poll results this long after a Home write
+#define IN_USE_WATTS      2.0f           // metered plug: "In Use" above this many watts
 // =============================================================================
 
 // ---- Thread-safe handoff: WiZ task (core 0)  <->  HomeSpan (loop, core 1) -----
@@ -89,6 +90,8 @@ struct PollResult {              // one getPilot result, produced by the task
   bool   reachable = false;
   bool   state = false;
   int    dimming = -1, temp = -1, r = -1, g = -1, b = -1;   // -1 = field absent
+  float  watts = -1;             // plug power draw (getPower): -1 = not metered,
+                                 // NAN = metered but no reading this poll
 };
 struct DiscResult {             // one discovered device, produced by the task
   String    mac, type, module;
@@ -100,6 +103,9 @@ struct DeviceAddr {             // a poll target + its health/backoff state
   uint8_t   fails = 0;          // consecutive poll failures
   uint32_t  nextPollMs = 0;     // earliest millis() to poll again (backoff)
   bool      online = true;      // current reachability
+  bool      isPlug = false;     // outlet -> also try getPower
+  int8_t    meter = -1;         // power meter: -1 unknown, 0 no, 1 yes
+  uint8_t   meterTries = 0;     // unanswered getPower probes while meter unknown
 };
 
 volatile bool            wifiUp = false;  // set true once WiFi is connected
@@ -312,13 +318,14 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
   IPAddress ip;
   String mac;
   SpanCharacteristic *power;
+  SpanCharacteristic *inUse;
 
   void   setIp(IPAddress n) override { ip = n; }
   String macAddr() override { return mac; }
 
   WiZOutlet(IPAddress ip, const String &mac) : Service::Outlet(), ip(ip), mac(mac) {
     power = new Characteristic::On(false);
-    new Characteristic::OutletInUse(true);
+    inUse = new Characteristic::OutletInUse(false);
   }
 
   boolean update() override {
@@ -330,6 +337,11 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
   void applyPilot(const PollResult &p) override {
     if (!p.reachable || settling()) return;
     if (power->getVal<bool>() != p.state) power->setVal(p.state);
+    // Metered plug: In Use = something is actually drawing power.
+    // Plain plug: no way to tell, so In Use simply follows On.
+    if (isnan(p.watts)) return;                 // missed reading: keep last In Use
+    bool use = (p.watts >= 0) ? (p.state && p.watts >= IN_USE_WATTS) : p.state;
+    if (inUse->getVal<bool>() != use) inUse->setVal(use);
   }
 };
 
@@ -446,7 +458,8 @@ static bool createAccessory(IPAddress ip, const String &mac,
   knownMacs.push_back(mac);
 
   xSemaphoreTake(wizMux, portMAX_DELAY);   // register as a poll target for the task
-  deviceAddrs.push_back({mac, ip});
+  DeviceAddr da; da.mac = mac; da.ip = ip; da.isPlug = (type == "SOCKET");
+  deviceAddrs.push_back(da);
   xSemaphoreGive(wizMux);
   return true;
 }
@@ -581,6 +594,7 @@ static void taskReport(IPAddress ip, std::vector<DiscResult> &dOut,
 
   dOut.push_back({mac, type, module, ip});
   PollResult pr; pr.mac = mac;
+  if (type == "SOCKET") pr.watts = NAN;   // In Use is left to the regular poll
   if (havePilot) parsePilot(pilot["result"], pr);
   pOut.push_back(pr);
 }
@@ -615,7 +629,12 @@ static void taskDiscoverRound(float timeoutSec, int passes) {
 // DHCP reassigning this IP to a DIFFERENT WiZ device (which would otherwise let
 // one bulb's state be attributed to another). A mismatch is treated as a miss,
 // so the device backs off and re-discovery refreshes its IP by MAC.
-static bool pollOne(const DeviceAddr &d) {
+//
+// Plugs are also asked getPower. `meter` reports what we learned: 1 = it has a
+// power meter, 0 = it answered "method not found" (never ask again), -1 = no
+// answer this time (the caller gives up after a few of those).
+static bool pollOne(const DeviceAddr &d, int8_t &meter) {
+  meter = d.meter;
   JsonDocument doc;
   PollResult pr; pr.mac = d.mac;
   if (wizQuery(d.ip, "getPilot", doc, 0.6f)) {
@@ -626,6 +645,17 @@ static bool pollOne(const DeviceAddr &d) {
     else
       Serial.printf("[WiZ] %s: reply from wrong MAC %s (IP reused) - ignoring\n",
                     d.mac.c_str(), replyMac.c_str());
+  }
+  if (pr.reachable && d.isPlug && d.meter != 0) {
+    if (d.meter == 1) pr.watts = NAN;           // until this poll's reading arrives
+    if (wizQuery(d.ip, "getPower", doc, 0.6f)) {
+      if (!doc["result"]["power"].isNull()) {
+        pr.watts = doc["result"]["power"].as<float>() / 1000.0f;   // mW -> W
+        meter = 1;
+      } else if (!doc["error"].isNull()) {
+        meter = 0;                              // firmware has no power meter
+      }
+    }
   }
   if (pr.reachable) {
     xSemaphoreTake(wizMux, portMAX_DELAY);
@@ -669,11 +699,18 @@ static void wizTaskFn(void *) {
     xSemaphoreGive(wizMux);
 
     if (have) {
-      bool ok = pollOne(d);                       // blocking UDP, outside the lock
+      int8_t meter;
+      bool ok = pollOne(d, meter);                // blocking UDP, outside the lock
       now = millis();
       xSemaphoreTake(wizMux, portMAX_DELAY);
       for (auto &e : deviceAddrs) {
         if (e.mac != d.mac) continue;
+        // A plug that answers getPilot but never getPower has no meter either.
+        if (ok && e.isPlug && meter < 0 && ++e.meterTries >= 3) meter = 0;
+        if (meter != e.meter && meter >= 0) {
+          e.meter = meter;
+          Serial.printf("[WiZ] %s power meter: %s\n", e.mac.c_str(), meter ? "yes" : "no");
+        }
         if (ok) {                                 // reachable -> healthy, normal cadence
           if (!e.online) {
             e.online = true;
