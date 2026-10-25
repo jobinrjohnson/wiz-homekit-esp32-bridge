@@ -42,24 +42,46 @@ range:
 | Reed contact sensor | 2 |
 | WiZ devices | `100 + low24(MAC)` |
 
+## Saved device list (NVS)
+
+Stable AIDs alone aren't enough. When HomeKit connects to the bridge it compares
+the accessory list with what it has stored, and **deletes every bridged
+accessory that's missing** — together with its name, room and automations. If
+the device comes back later, Home treats it as brand new.
+
+HomeSpan starts answering HomeKit within seconds of boot, but WiZ discovery runs
+in a background task and takes ~10 s. So if accessories were built from live
+discovery only, your home hub would connect while just the bridge and the door
+sensor exist, and Home would drop every WiZ device on **every** restart.
+
+So every device the bridge has ever bridged is saved to NVS (namespace
+`wizbridge`: MAC, type, module, firmware, last IP) and **recreated in `setup()`,
+before HomeKit can connect**. Discovery then only refreshes IPs and adds new
+devices, and the saved copy is updated when an IP or firmware version changes.
+
 ## What this guarantees
 
-- **Restart → same AIDs** for every device present → Home keeps all names, rooms,
-  and automations. No re-adding.
+- **Restart → same accessories, same AIDs** → Home keeps all names, rooms and
+  automations — even for a device that is powered off while the ESP32 boots.
 - **DHCP IP change** is invisible to HomeKit (identity is the MAC, not the IP; the
   new IP is just used for control/polling).
 
-## The one tradeoff (pure-deterministic, no NVS)
+## Devices that are gone for good
 
-Accessories are built from **live discovery** only — there's no persisted list.
-So a device that is **powered off when the ESP32 boots** isn't created that boot;
-it appears when the next re-scan finds it (with the *same* AID as always). During
-that gap it's absent from Home and may briefly lose its tile/room until it
-returns. For always-on devices this never happens.
+Because the list is saved, a device you remove from your home stays in Home
+(showing its last state; HomeSpan can't mark a bridged accessory "No Response").
+To remove it, type this in the serial monitor (MAC from the boot log or the Home
+app's serial number field):
 
-(If you ever want offline-at-boot devices to stay present as "No Response"
-instead, that requires persisting the device list to NVS — a deliberate
-trade-off not taken here, in favour of simplicity.)
+```
+@f9877d5af83d2
+```
+
+That deletes its accessory from Home and from the saved list. If the device is
+actually still on the network, the next scan adds it back as a new accessory.
+
+Erasing all NVS (serial `E`) also clears the list; a factory reset (`F`, or
+holding BOOT 10 s) does not, but it unpairs the bridge anyway.
 
 ## Collision note
 
@@ -72,3 +94,8 @@ fleet and hit a clash, switching to the low 4 bytes would remove it.
 If you previously ran a version with implicit AIDs, the WiZ AIDs change once when
 you move to MAC-based IDs. **Remove and re-add the bridge a final time**; after
 that, IDs are permanent and reboots are safe.
+
+The **first boot with the saved device list** starts with an empty list, so Home
+drops the WiZ devices one last time (exactly what happened on every reboot
+before). Once they reappear, set their names and rooms again — from then on
+they survive restarts.

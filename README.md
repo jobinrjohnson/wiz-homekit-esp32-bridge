@@ -14,7 +14,8 @@ switch** (door/window contact sensor) wired to a GPIO.
 - **Phone-based WiFi setup** — no hardcoded credentials; provision from your
   iPhone via a setup Wi-Fi network.
 - **Reboot-stable** — each device gets a permanent HomeKit ID derived from its
-  MAC, so names/rooms/automations survive restarts.
+  MAC, and the device list is saved and recreated at boot, so names/rooms/
+  automations survive restarts.
 - **Self-healing** — re-scans periodically; devices missed at boot or added later
   appear automatically.
 - **Local hardware** — a reed switch on a GPIO shows up as a HomeKit Contact

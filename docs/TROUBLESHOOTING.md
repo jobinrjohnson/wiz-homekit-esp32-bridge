@@ -55,6 +55,17 @@ This is what the **MAC-based stable AIDs** fix — make sure you're on the curre
 firmware. After upgrading from an older (implicit-AID) version, re-add the bridge
 **once**; it's stable thereafter. See [STABLE-IDS.md](STABLE-IDS.md).
 
+## Rooms/names reset after the bridge restarts
+Home deletes bridged accessories that are missing when it reconnects. Current
+firmware saves the device list to NVS and recreates it at boot (look for
+`[WiZ] restored N saved device(s)` in the log). The first boot after updating
+starts with an empty list, so set up rooms and names once more; after that they
+stick. See [STABLE-IDS.md](STABLE-IDS.md#saved-device-list-nvs).
+
+## A WiZ device you removed is still in Home
+The saved list keeps it. Type `@f<mac>` in the serial monitor to remove it —
+see [STABLE-IDS.md](STABLE-IDS.md#devices-that-are-gone-for-good).
+
 ## A device shows the wrong type (e.g. plug as a bulb)
 Check the `Module`/`Raw config` line in the boot log against the table in
 [WIZ_PROTOCOL.md](WIZ_PROTOCOL.md#module-naming). If `moduleName` was empty, the
