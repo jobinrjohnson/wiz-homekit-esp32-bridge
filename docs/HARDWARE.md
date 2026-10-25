@@ -40,7 +40,9 @@ If Home shows Open when the door is closed, flip `REED_ACTIVE_LOW`.
 | 6–11 | ❌ wired to the SPI flash — never use |
 | 1, 3 | ⚠️ UART0 TX/RX — used by the serial monitor |
 
-GPIO **23** is the safe default used here.
+GPIO **23** is the safe default used here. GPIO **0** (BOOT button) and
+**2** (onboard LED) are already used as HomeSpan's control button and status
+LED, so don't wire sensors to them.
 
 ## Adding more sensors
 

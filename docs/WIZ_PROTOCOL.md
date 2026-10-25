@@ -46,7 +46,10 @@ A device is in **either** color mode (`r,g,b`) **or** CCT mode (`temp`).
 ```json
 {"method":"getPower","params":{}}  →  {"result":{"power": 12345}}   // milliwatts
 ```
-Plugs without a meter reply with an `"error"` object instead. HomeKit has no
+Older firmware replies `{"error":{"code":-32601,"message":"Method not found"}}`.
+Newer (ESP25) firmware answers on every device — bulbs and meter-less plugs
+included — with a constant `0`, so only a non-zero reading proves there is a
+meter. HomeKit has no
 power characteristic, so the bridge only uses this to set the outlet's
 **In Use** status — see [LIMITATIONS.md](LIMITATIONS.md).
 

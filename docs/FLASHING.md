@@ -78,3 +78,29 @@ With the Serial Monitor open (line-ending = **Newline**), type a letter + Enter:
 > A plain re-upload does **not** clear WiFi or pairing — those live in NVS. To
 > wipe them, use `X`/`H`/`F`/`E`, or enable **Tools → "Erase All Flash Before
 > Sketch Upload"** before uploading.
+
+## BOOT button menu
+No computer needed: the board's **BOOT** button (GPIO 0) is HomeSpan's control
+button, and the onboard blue LED (GPIO 2) shows what the bridge is doing.
+
+| LED | Meaning |
+|-----|---------|
+| Solid on | Connected to HomeKit (normal) |
+| Slow flashing | Connecting to WiFi |
+| Slow double blink | Not paired with Home yet |
+| Mostly on, double "off" blink | Paired, waiting for Home to connect |
+| Rapid double blink | WiFi setup Access Point running |
+
+**Command menu**
+1. Hold BOOT ~3 s until the LED flashes rapidly, then release.
+2. The LED blinks N times for option N; a short press moves to the next one:
+   1 Exit · 2 Reboot · 3 Start the WiFi setup AP · 4 Unpair from Home ·
+   5 Erase WiFi.
+3. Hold ~3 s to run the selected option. The menu closes by itself after 2 min.
+
+> ⚠️ Holding BOOT for **10 s or more** is a **factory reset** (WiFi and HomeKit
+> pairing erased): you'd re-add the bridge in Home and redo its rooms and
+> automations.
+
+The boot banner's `Sketch Version` line shows when the running firmware was
+compiled, so you can confirm an upload actually landed.
