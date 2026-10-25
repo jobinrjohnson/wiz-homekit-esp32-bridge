@@ -90,7 +90,7 @@ struct PollResult {              // one getPilot result, produced by the task
   bool   reachable = false;
   bool   state = false;
   int    dimming = -1, temp = -1, r = -1, g = -1, b = -1;   // -1 = field absent
-  float  watts = -1;             // plug power draw (getPower): -1 = not metered,
+  float  watts = -1;             // plug power draw (getPower): -1 = no confirmed meter,
                                  // NAN = metered but no reading this poll
 };
 struct DiscResult {             // one discovered device, produced by the task
@@ -104,8 +104,9 @@ struct DeviceAddr {             // a poll target + its health/backoff state
   uint32_t  nextPollMs = 0;     // earliest millis() to poll again (backoff)
   bool      online = true;      // current reachability
   bool      isPlug = false;     // outlet -> also try getPower
-  int8_t    meter = -1;         // power meter: -1 unknown, 0 no, 1 yes
-  uint8_t   meterTries = 0;     // unanswered getPower probes while meter unknown
+  int8_t    meter = -1;         // power meter: -1 unknown, 0 no, 1 yes (has read > 0 W)
+  uint8_t   meterTries = 0;     // consecutive unanswered getPower probes while unknown
+  bool      zeroNoted = false;  // logged that this plug answers getPower with 0 W
 };
 
 volatile bool            wifiUp = false;  // set true once WiFi is connected
@@ -339,7 +340,7 @@ struct WiZOutlet : Service::Outlet, WiZPollable {
     if (!p.reachable || settling()) return;
     if (power->getVal<bool>() != p.state) power->setVal(p.state);
     // Metered plug: In Use = something is actually drawing power.
-    // Plain plug: no way to tell, so In Use simply follows On.
+    // Otherwise (no meter, or it has only ever read 0 W): In Use follows On.
     if (isnan(p.watts)) return;                 // missed reading: keep last In Use
     bool use = (p.watts >= 0) ? (p.state && p.watts >= IN_USE_WATTS) : p.state;
     if (inUse->getVal<bool>() != use) inUse->setVal(use);
@@ -670,11 +671,14 @@ static void taskDiscoverRound(float timeoutSec, int passes) {
 // one bulb's state be attributed to another). A mismatch is treated as a miss,
 // so the device backs off and re-discovery refreshes its IP by MAC.
 //
-// Plugs are also asked getPower. `meter` reports what we learned: 1 = it has a
-// power meter, 0 = it answered "method not found" (never ask again), -1 = no
-// answer this time (the caller gives up after a few of those).
-static bool pollOne(const DeviceAddr &d, int8_t &meter) {
+// Plugs are also asked getPower. Plugs without a meter (and even ESP25 bulbs)
+// still answer it, always with 0 W, so a plug only counts as metered once it
+// has read more than 0 W. `meter` becomes 1 when that happens, 0 if the
+// firmware answered "method not found" (never ask again), else it's unchanged.
+// `powerReply` says whether getPower got any answer this time.
+static bool pollOne(const DeviceAddr &d, int8_t &meter, bool &powerReply) {
   meter = d.meter;
+  powerReply = false;
   JsonDocument doc;
   PollResult pr; pr.mac = d.mac;
   if (wizQuery(d.ip, "getPilot", doc, 0.6f)) {
@@ -689,11 +693,13 @@ static bool pollOne(const DeviceAddr &d, int8_t &meter) {
   if (pr.reachable && d.isPlug && d.meter != 0) {
     if (d.meter == 1) pr.watts = NAN;           // until this poll's reading arrives
     if (wizQuery(d.ip, "getPower", doc, 0.6f)) {
+      powerReply = true;
       if (!doc["result"]["power"].isNull()) {
-        pr.watts = doc["result"]["power"].as<float>() / 1000.0f;   // mW -> W
-        meter = 1;
+        float w = doc["result"]["power"].as<float>() / 1000.0f;   // mW -> W
+        if (w > 0) meter = 1;
+        if (meter == 1) pr.watts = w;
       } else if (!doc["error"].isNull()) {
-        meter = 0;                              // firmware has no power meter
+        meter = 0;                              // firmware has no getPower
       }
     }
   }
@@ -783,14 +789,22 @@ static void wizTaskFn(void *) {
     xSemaphoreGive(wizMux);
 
     if (have) {
-      int8_t meter;
-      bool ok = pollOne(d, meter);                // blocking UDP, outside the lock
+      int8_t meter; bool powerReply;
+      bool ok = pollOne(d, meter, powerReply);    // blocking UDP, outside the lock
       now = millis();
       xSemaphoreTake(wizMux, portMAX_DELAY);
       for (auto &e : deviceAddrs) {
         if (e.mac != d.mac) continue;
-        // A plug that answers getPilot but never getPower has no meter either.
-        if (ok && e.isPlug && meter < 0 && ++e.meterTries >= 3) meter = 0;
+        if (ok && e.isPlug && e.meter < 0) {
+          // A plug that answers getPilot but never getPower has no meter either.
+          e.meterTries = powerReply ? 0 : e.meterTries + 1;
+          if (e.meterTries >= 3) meter = 0;
+          if (powerReply && meter < 0 && !e.zeroNoted) {
+            e.zeroNoted = true;
+            Serial.printf("[WiZ] %s power meter: reads 0 W - In Use follows On until it "
+                          "reports power\n", e.mac.c_str());
+          }
+        }
         if (meter != e.meter && meter >= 0) {
           e.meter = meter;
           Serial.printf("[WiZ] %s power meter: %s\n", e.mac.c_str(), meter ? "yes" : "no");

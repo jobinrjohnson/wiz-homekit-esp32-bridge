@@ -11,9 +11,11 @@ cannot display watts or kWh** — it only shows the on/off outlet.
 
 **What the bridge does natively:** the Outlet's standard `OutletInUse`
 characteristic is driven from `getPower` — *In Use* when the plug is on and
-drawing at least `IN_USE_WATTS` (default 2 W). Plugs without a meter (they
-answer `getPower` with an error, or not at all) simply report In Use = On.
-The meter is auto-detected per plug; look for `power meter: yes/no` in the log.
+drawing at least `IN_USE_WATTS` (default 2 W). A plug only counts as metered
+once it has read **more than 0 W**: plugs without a meter still answer
+`getPower`, always with `0` (so do ESP25 bulbs), and an error or no answer means
+no meter at all. Until a plug proves it has a meter, In Use simply follows On.
+The log shows `power meter: yes`, `no`, or `reads 0 W` per plug.
 
 **Workaround — Eve custom characteristics.** Eve defined unofficial UUIDs
 (`E863F1…`) for power/energy that the **Eve app**, Controller for HomeKit, Home+,
